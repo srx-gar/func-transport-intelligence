@@ -1,0 +1,16 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "DefaultEndpointsProtocol=https;AccountName=gartransportintelligence;AccountKey=<KEY>;EndpointSuffix=core.windows.net",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "DB_CLIENT": "pg",
+    "DB_HOST": "poc-gar-db.postgres.database.azure.com",
+    "DB_PORT": "5432",
+    "DB_USER": "ti_user",
+    "DB_PASSWORD": "<PASSWORD>",
+    "DB_NAME": "transport_intelligence",
+    "VALIDATION_ERROR_THRESHOLD": "0.10",
+    "ENABLE_MV_REFRESH": "true",
+    "ALERT_EMAIL": "ops-team@company.com"
+  }
+}
