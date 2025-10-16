@@ -36,6 +36,7 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+          enable-AzPSSession: false
 
       - name: Configure Azure Function App Settings
         uses: azure/cli@v2
