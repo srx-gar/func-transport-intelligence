@@ -10,6 +10,8 @@ import io
 import os
 from datetime import datetime
 import uuid
+from azure.storage.blob import BlobServiceClient
+import json
 
 # Import helper modules
 from helpers.parser import parse_ztdwr_file, is_gzipped
@@ -25,12 +27,8 @@ from helpers.notifier import send_alert_email
 
 app = func.FunctionApp()
 
-@app.blob_trigger(
-    arg_name="myblob",
-    path="data/hex-ztdwr/{name}",
-    connection="AzureWebJobsStorage"
-)
-def ztdwr_sync(myblob: func.InputStream):
+@app.event_grid_trigger(arg_name="event")
+def ztdwr_sync(event: func.EventGridEvent):
     """
     Triggered when new ZTDWR .dat file is uploaded to Azure Storage.
 
@@ -45,26 +43,44 @@ def ztdwr_sync(myblob: func.InputStream):
     8. Update sync metadata
     """
 
-    logging.info(f"Python blob trigger function processing blob")
-    logging.info(f"Name: {myblob.name}")
-    logging.info(f"Blob Size: {myblob.length} bytes")
+    logging.info(f"Python Event Grid trigger function processing event")
+    logging.info(f"Subject: {event.subject}")
+    logging.info(f"Event Type: {event.event_type}")
+
+    # Get blob URL from event data
+    event_data = event.get_json()
+    blob_url = event_data['url']
+    
+    # Extract container and blob name from URL
+    blob_path_parts = blob_url.split('/')
+    container_name = blob_path_parts[3]
+    blob_name = '/'.join(blob_path_parts[4:])
 
     # Generate unique sync ID
     sync_id = f"sync_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    file_name = myblob.name.split('/')[-1]
-
-    # Initialize metadata
-    update_sync_metadata(
-        sync_id=sync_id,
-        file_name=file_name,
-        file_path=myblob.name,
-        file_size_bytes=myblob.length,
-        status='IN_PROGRESS'
-    )
+    file_name = blob_name.split('/')[-1]
 
     try:
+        # Get blob content
+        connect_str = os.getenv('AzureWebJobsStorage')
+        blob_service_client = BlobServiceClient.from_connection_string(connect_str)
+        blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+        
+        blob_properties = blob_client.get_blob_properties()
+        blob_size = blob_properties.size
+
+        # Initialize metadata
+        update_sync_metadata(
+            sync_id=sync_id,
+            file_name=file_name,
+            file_path=blob_name,
+            file_size_bytes=blob_size,
+            status='IN_PROGRESS'
+        )
+
         # Step 1: Read blob content
-        blob_content = myblob.read()
+        blob_content_downloader = blob_client.download_blob()
+        blob_content = blob_content_downloader.readall()
         logging.info(f"Downloaded {len(blob_content)} bytes")
 
         # Step 2: Decompress (if gzipped)
