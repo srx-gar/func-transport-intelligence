@@ -1,10 +1,216 @@
-"""
-Data transformation utilities for ZTDWR to transport_documents schema
-"""
+"""Data transformation utilities for ZTDWR to transport_documents schema."""
+
+import logging
+from datetime import datetime
 
 import pandas as pd
-from datetime import datetime
-import logging
+
+
+TARGET_COLUMNS = [
+    'surat_pengantar_barang',
+    'waktu_buat',
+    'no_tiket',
+    'transporter',
+    'transporter_name',
+    'sender',
+    'sender_name',
+    'receiver',
+    'receiver_name',
+    'nama_pt',
+    'pengangkut',
+    'id_kendaraan',
+    'jenis_kendaraan',
+    'kapasitas_kendaraan',
+    'category_truck',
+    'jenis_angkutan',
+    'nomor_asset',
+    'qty_dikirim',
+    'qty_diterima',
+    'base_unit_of_measure',
+    'waktu_surat_jalan',
+    'waktu_timbang_kirim',
+    'waktu_timbang_terima',
+    'waktu_kembali',
+    'no_kontrak_do',
+    'equipment',
+    'no_polisi',
+    'kilometer_std',
+    'kilometer_actual',
+    'bbm_std',
+    'bbm_actual',
+    'asal',
+    'tujuan',
+    'ongkos_angkut',
+    'divisi_sender',
+    'division_receiver',
+    'external',
+    'reservation',
+    'item_no_stock_transfer_reserv',
+    'nik_supir',
+    'nik_pemuat_1',
+    'nik_pemuat_2',
+    'nik_pemuat_3',
+    'nik_pemuat_4',
+    'nik_pemuat_5',
+    'nik_supir_mandah',
+    'nama_supir',
+    'hk',
+    'waktu_pembuatan_konfirmasi',
+    'user_pembuatan_konfirmasi',
+    'waktu_pembatalan_konfirmasi',
+    'user_pembatalan_konfirmasi',
+    'susut_timbang',
+    'pindah_muatan',
+    'jaring_tbs',
+    'settlement_order',
+    'kontanan',
+    'sewa',
+    'flag_post_yes',
+    'backhauling',
+    'posisi_divisi',
+    'nomor_work_order',
+    'no_work_order_operation',
+    'no_konfirmasi',
+    'konfirmasi_counter',
+    'konfirmasi_posting_date',
+    'posting_date_gi',
+    'good_issue_document',
+    'measurement_document',
+    'no_po',
+    'no_so_besar',
+    'so_besar_item',
+    'no_so_kecil',
+    'so_kecil_item',
+    'waktu_pembuatan_so_kecil',
+    'user_pembuatan_so_kecil',
+    'delete_by',
+    'delete_on',
+    'deletion_indicator_in_tdw',
+    'processed_gi',
+    'cancel_gi',
+    'processed_confirmation',
+    'changed_by',
+    'changed_date',
+    'ztdw_enhancement',
+    'changed_time',
+]
+
+TRUE_VALUES = {'X', '1', 'Y', 'YES', 'TRUE', 'T'}
+FALSE_VALUES = {'0', 'N', 'NO', 'FALSE', 'F'}
+
+
+def _normalize_value(value):
+    """Standardize placeholder strings to None and strip whitespace."""
+    if pd.isna(value):
+        return None
+    if isinstance(value, str):
+        normalized = value.strip()
+        if normalized in {'', '~', 'NULL', 'null', 'None'}:
+            return None
+        return normalized
+    return value
+
+
+def _string_value(value):
+    normalized = _normalize_value(value)
+    return str(normalized) if normalized is not None else None
+
+
+def _decimal_value(value):
+    normalized = _normalize_value(value)
+    if normalized is None:
+        return None
+    if isinstance(normalized, (int, float)):
+        return float(normalized)
+    text = str(normalized)
+    if ',' in text and '.' in text:
+        text = text.replace('.', '').replace(',', '.')
+    elif ',' in text:
+        text = text.replace(',', '.')
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _bool_value(value):
+    normalized = _normalize_value(value)
+    if normalized is None:
+        return None
+    if isinstance(normalized, bool):
+        return normalized
+    text = str(normalized).strip().upper()
+    if text in TRUE_VALUES:
+        return True
+    if text in FALSE_VALUES:
+        return False
+    return None
+
+
+def _normalize_date_component(value):
+    normalized = _normalize_value(value)
+    if normalized is None:
+        return None
+    if isinstance(normalized, (pd.Timestamp, datetime)):
+        return pd.to_datetime(normalized).strftime('%Y-%m-%d')
+
+    text = str(normalized)
+    if text.isdigit() and len(text) == 8:
+        return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
+
+    parsed = pd.to_datetime(text, errors='coerce')
+    if pd.isna(parsed):
+        return None
+    return parsed.strftime('%Y-%m-%d')
+
+
+def _normalize_time_component(value):
+    normalized = _normalize_value(value)
+    if normalized is None:
+        return None
+    if isinstance(normalized, (pd.Timestamp, datetime)):
+        return pd.to_datetime(normalized).strftime('%H:%M:%S')
+
+    text = str(normalized).replace(':', '')
+    if not text.isdigit():
+        return None
+    if set(text) == {'0'}:
+        return None
+
+    length = len(text)
+    if length == 6:
+        return f"{text[0:2]}:{text[2:4]}:{text[4:6]}"
+    if length == 4:
+        return f"{text[0:2]}:{text[2:4]}:00"
+    if length == 2:
+        return f"{text[0:2]}:00:00"
+    return None
+
+
+def _combine_datetime_series(df: pd.DataFrame, date_col: str, time_col: str | None = None) -> pd.Series:
+    if date_col not in df.columns:
+        return pd.Series([pd.NaT] * len(df), index=df.index)
+
+    def _combine(row) -> pd.Timestamp:
+        date_str = _normalize_date_component(row.get(date_col))
+        if date_str is None:
+            return pd.NaT
+
+        time_value = None
+        if time_col and time_col in row.index:
+            time_value = _normalize_time_component(row.get(time_col))
+
+        if time_value:
+            return pd.to_datetime(f"{date_str} {time_value}", errors='coerce')
+        return pd.to_datetime(date_str, errors='coerce')
+
+    return df.apply(_combine, axis=1)
+
+
+def _get_series(df: pd.DataFrame, column: str, converter, default=None) -> pd.Series:
+    if column not in df.columns:
+        return pd.Series([default] * len(df), index=df.index)
+    return df[column].apply(converter)
 
 
 def transform_to_transport_documents(
@@ -12,69 +218,119 @@ def transform_to_transport_documents(
     sync_id: str,
     file_name: str
 ) -> pd.DataFrame:
-    """
-    Transform ZTDWR DataFrame to transport_documents schema.
+    """Transform ZTDWR DataFrame to transport_documents schema."""
 
-    Maps SAP column names to PostgreSQL column names and applies
-    data type conversions.
-    """
+    logging.info("Starting transformation to transport_documents schema")
 
-    # Column mapping (SAP -> PostgreSQL)
-    # This is a basic mapping - adjust based on actual SAP column names
-    column_mapping = {
-        'SPB_ID': 'spb_id',
-        'WAKTU_TIMBANG_TERIMA': 'waktu_timbang_terima',
-        'TGL_SPB': 'tgl_spb',
-        'DRIVER_NIK': 'driver_nik',
-        'DRIVER_NAME': 'driver_name',
-        'NOPOL': 'nopol',
-        'JENIS_KENDARAAN': 'jenis_kendaraan',
-        'JENIS_ANGKUTAN': 'jenis_angkutan',
-        'ORIGIN': 'origin',
-        'DESTINATION': 'destination',
-        'BRUTO_TIMBANG': 'bruto_timbang',
-        'NETTO_TIMBANG': 'netto_timbang',
-        'BBM_ACTUAL': 'bbm_actual',
-        'KILOMETER_ACTUAL': 'kilometer_actual',
-        'TERRITORY_ID': 'territory_id',
-    }
+    transformed = pd.DataFrame(index=df.index)
 
-    # Create copy and rename only columns that exist
-    transformed = df.copy()
-    existing_mappings = {k: v for k, v in column_mapping.items() if k in df.columns}
-    transformed = transformed.rename(columns=existing_mappings)
+    # Direct mappings with optional conversions
+    transformed['surat_pengantar_barang'] = _get_series(df, 'surat_pengantar_brg', _string_value)
+    transformed['waktu_buat'] = _combine_datetime_series(df, 'tanggal_buat', 'waktu_buat')
+    transformed['no_tiket'] = _get_series(df, 'no_tiket', _string_value)
+    transformed['transporter'] = _get_series(df, 'transporter', _string_value)
+    transformed['transporter_name'] = _get_series(df, 'transporter_name', _string_value)
+    transformed['sender'] = _get_series(df, 'sender', _string_value)
+    transformed['sender_name'] = _get_series(df, 'sender_name', _string_value)
+    transformed['receiver'] = _get_series(df, 'receiver', _string_value)
+    transformed['receiver_name'] = _get_series(df, 'receiver_name', _string_value)
+    transformed['nama_pt'] = _get_series(df, 'nama_pt', _string_value)
+    transformed['pengangkut'] = _get_series(df, 'pengangkut', _string_value)
+    transformed['id_kendaraan'] = _get_series(df, 'id_kendaraan', _string_value)
+    transformed['jenis_kendaraan'] = _get_series(df, 'jenis_kendaraan', _string_value)
+    transformed['kapasitas_kendaraan'] = _get_series(df, 'kapasitas_kendaraan', _decimal_value)
+    transformed['category_truck'] = _get_series(df, 'type_equipment', _string_value)
+    transformed['jenis_angkutan'] = _get_series(df, 'jenis_angkutan', _string_value)
+    transformed['nomor_asset'] = _get_series(df, 'nomor_aset', _string_value)
+    transformed['qty_dikirim'] = _get_series(df, 'qty_dikirim', _decimal_value)
+    transformed['qty_diterima'] = _get_series(df, 'qty_diterima', _decimal_value)
+    transformed['base_unit_of_measure'] = _get_series(df, 'base_unit_of_measure', _string_value)
+    transformed['waktu_surat_jalan'] = _combine_datetime_series(df, 'tanggal_surat_jalan', 'jam_surat_jalan')
+    transformed['waktu_timbang_kirim'] = _combine_datetime_series(df, 'tanggal_timbang_kirim', 'jam_timbang_kirim')
+    transformed['waktu_timbang_terima'] = _combine_datetime_series(df, 'tanggal_timbang', 'jam_timbang')
+    transformed['waktu_kembali'] = _combine_datetime_series(df, 'tanggal_kembali', 'jam_kembali')
+    transformed['no_kontrak_do'] = _get_series(df, 'no_kontrak', _string_value)
+    transformed['equipment'] = _get_series(df, 'equipment', _string_value)
+    transformed['no_polisi'] = _get_series(df, 'no_polisi', _string_value)
+    transformed['kilometer_std'] = _get_series(df, 'kilometer_std', _decimal_value)
+    transformed['kilometer_actual'] = _get_series(df, 'kilometer_actual', _decimal_value)
+    transformed['bbm_std'] = _get_series(df, 'bbm_std', _decimal_value)
+    transformed['bbm_actual'] = _get_series(df, 'bbm_actual', _decimal_value)
+    transformed['asal'] = _get_series(df, 'asal', _string_value)
+    transformed['tujuan'] = _get_series(df, 'tujuan', _string_value)
+    transformed['ongkos_angkut'] = _get_series(df, 'ongkos_angkut', _decimal_value)
+    transformed['divisi_sender'] = _get_series(df, 'divisi_sender', _string_value)
+    transformed['division_receiver'] = _get_series(df, 'division_receiver', _string_value)
+    transformed['external'] = _get_series(df, 'client', _string_value)
+    transformed['reservation'] = _get_series(df, 'reservation', _string_value)
+    transformed['item_no_stock_transfer_reserv'] = _get_series(df, 'item_no_stock_transfer_reserv', _string_value)
+    transformed['nik_supir'] = _get_series(df, 'nik_supir', _string_value)
+    transformed['nik_pemuat_1'] = _get_series(df, 'nik_pemuat_1', _string_value)
+    transformed['nik_pemuat_2'] = _get_series(df, 'nik_pemuat_2', _string_value)
+    transformed['nik_pemuat_3'] = _get_series(df, 'nik_pemuat_3', _string_value)
+    transformed['nik_pemuat_4'] = _get_series(df, 'nik_pemuat_4', _string_value)
+    transformed['nik_pemuat_5'] = _get_series(df, 'nik_pemuat_5', _string_value)
+    transformed['nik_supir_mandah'] = _get_series(df, 'nik_supir_mandah', _string_value)
+    transformed['nama_supir'] = _get_series(df, 'nama_supir', _string_value)
+    transformed['hk'] = _get_series(df, 'hk', _decimal_value)
+    transformed['waktu_pembuatan_konfirmasi'] = _combine_datetime_series(df, 'tanggal_pembuatan_konfirmasi', 'jam_pembuatan_konfirmasi')
+    transformed['user_pembuatan_konfirmasi'] = _get_series(df, 'user_pembuatan_konfirmasi', _string_value)
+    transformed['waktu_pembatalan_konfirmasi'] = _combine_datetime_series(df, 'tanggal_pembatalan_konfirmasi', 'jam_pembatalan_konfirmasi')
+    transformed['user_pembatalan_konfirmasi'] = _get_series(df, 'user_pembatalan_konfirmasi', _string_value)
+    transformed['susut_timbang'] = _get_series(df, 'susut_timbang', _bool_value)
+    transformed['pindah_muatan'] = _get_series(df, 'pindah_muatan', _string_value)
+    transformed['jaring_tbs'] = _get_series(df, 'jaring_tbs', _decimal_value)
+    transformed['settlement_order'] = _get_series(df, 'settlement_order', _string_value)
+    transformed['kontanan'] = _get_series(df, 'kontanan', _bool_value)
+    transformed['sewa'] = _get_series(df, 'sewa', _bool_value)
+    transformed['flag_post_yes'] = _get_series(df, 'flag_post', _bool_value)
+    transformed['backhauling'] = _get_series(df, 'backhauling', _string_value)
+    transformed['posisi_divisi'] = _get_series(df, 'posisi_divisi', _string_value)
+    transformed['nomor_work_order'] = _get_series(df, 'nomor_work_order', _string_value)
+    transformed['no_work_order_operation'] = _get_series(df, 'no_work_order_operation', _string_value)
+    transformed['no_konfirmasi'] = _get_series(df, 'no_konfirmasi', _string_value)
+    transformed['konfirmasi_counter'] = _get_series(df, 'konfirmasi_counter', _decimal_value)
+    transformed['konfirmasi_posting_date'] = _combine_datetime_series(df, 'konfirmasi_posting_date')
+    transformed['posting_date_gi'] = _combine_datetime_series(df, 'posting_date_gi')
+    transformed['good_issue_document'] = _get_series(df, 'good_issue_document', _string_value)
+    transformed['measurement_document'] = _get_series(df, 'measurement_document', _string_value)
+    transformed['no_po'] = _get_series(df, 'no_po', _string_value)
+    transformed['no_so_besar'] = _get_series(df, 'no_so_besar', _string_value)
+    transformed['so_besar_item'] = _get_series(df, 'so_besar_item', _string_value)
+    transformed['no_so_kecil'] = _get_series(df, 'no_so_kecil', _string_value)
+    transformed['so_kecil_item'] = _get_series(df, 'so_kecil_item', _string_value)
+    transformed['waktu_pembuatan_so_kecil'] = _combine_datetime_series(df, 'tanggal_pembuatan_so_kecil', 'jam_pembuatan_so_kecil')
+    transformed['user_pembuatan_so_kecil'] = _get_series(df, 'user_pembuatan_so_kecil', _string_value)
+    transformed['delete_by'] = _get_series(df, 'delete_by', _string_value)
+    transformed['delete_on'] = _combine_datetime_series(df, 'delete_on')
+    transformed['deletion_indicator_in_tdw'] = _get_series(df, 'delete_indicator_in_tdw', _string_value)
+    transformed['processed_gi'] = _get_series(df, 'processed_gi', _bool_value)
+    transformed['cancel_gi'] = _get_series(df, 'cancel_gi', _bool_value)
+    transformed['processed_confirmation'] = _get_series(df, 'processed_confirmation', _bool_value)
+    transformed['changed_by'] = _get_series(df, 'change_by', _string_value)
+    transformed['changed_date'] = _combine_datetime_series(df, 'change_date')
+    transformed['ztdw_enhancement'] = _get_series(df, 'ztdw_enhancement', _bool_value)
+    transformed['changed_time'] = _get_series(df, 'change_time', _string_value)
 
-    # Data type conversions
-    if 'waktu_timbang_terima' in transformed.columns:
-        transformed['waktu_timbang_terima'] = pd.to_datetime(
-            transformed['waktu_timbang_terima'],
-            errors='coerce'
-        )
+    # Ensure all expected columns exist even if missing from source
+    for column in TARGET_COLUMNS:
+        if column not in transformed.columns:
+            transformed[column] = pd.Series([None] * len(df), index=df.index)
 
-    if 'tgl_spb' in transformed.columns:
-        transformed['tgl_spb'] = pd.to_datetime(
-            transformed['tgl_spb'],
-            errors='coerce'
-        ).dt.date
+    # Order columns consistently
+    transformed = transformed[TARGET_COLUMNS]
 
-    # Numeric conversions
-    numeric_cols = [
-        'bruto_timbang', 'netto_timbang',
-        'bbm_actual', 'kilometer_actual'
-    ]
-    for col in numeric_cols:
-        if col in transformed.columns:
-            transformed[col] = pd.to_numeric(
-                transformed[col],
-                errors='coerce'
-            )
-
-    # Add audit columns
-    transformed['created_at'] = datetime.utcnow()
-    transformed['updated_at'] = datetime.utcnow()
+    # Add audit columns required by downstream upsert
+    timestamp_now = datetime.utcnow()
+    transformed['created_at'] = timestamp_now
+    transformed['updated_at'] = timestamp_now
     transformed['sync_id'] = sync_id
     transformed['source_file'] = file_name
 
-    logging.info(f"Transformed {len(transformed)} records to transport_documents schema")
+    logging.info(
+        "Transformed %s records to transport_documents schema (columns=%s)",
+        len(transformed),
+        list(transformed.columns)
+    )
 
     return transformed

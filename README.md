@@ -19,6 +19,7 @@ This Azure Function automatically processes daily SAP ZTDWR (Surat Perintah Jala
 - ✅ **Sync Metadata Tracking**: Complete audit trail in `sync_metadata` table
 - ✅ **Error Alerting**: Email notifications on failures (configurable)
 - ✅ **Health Check Endpoint**: `/api/healthz` for monitoring
+- ✅ **Manual HTTP Trigger**: `/api/sync-ztdwr` endpoint to reprocess files on demand
 
 ---
 
@@ -99,6 +100,53 @@ az storage blob upload \
 ```
 
 The function will trigger automatically.
+
+---
+
+## Manual Sync Trigger
+
+Use the new HTTP endpoint when you need to re-run the ETL for an existing blob without re-uploading it.
+
+1. **Get the function key** (once):
+   ```bash
+   az functionapp function keys list \
+     --resource-group poc-gar-blocktracker \
+     --name func-transport-intelligence \
+     --function-name sync-ztdwr \
+     --query "default" -o tsv
+   ```
+
+2. **Invoke the endpoint** (defaults to container `data` and folder `hex-ztdwr/`):
+   ```bash
+   curl -X POST \
+     "https://func-transport-intelligence.azurewebsites.net/api/sync-ztdwr?code=<FUNCTION_KEY>" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "blob_name": "UPP-ZTDWR-20251016025401.dat"
+     }'
+   ```
+
+   Optional payload fields:
+
+   - `blob_path`: full path inside the container (e.g. `hex-ztdwr/UPP-ZTDWR-20251016025401.dat`)
+   - `container`: override container name (defaults to `MANUAL_SYNC_CONTAINER` env, fallback `data`)
+
+   Successful responses include the `sync_id`, status, and record counts:
+
+   ```json
+   {
+     "sync_id": "sync_20251016_072530_ab12cd34",
+     "status": "SUCCESS",
+     "trigger": "http",
+     "records_total": 542,
+     "records_inserted": 520,
+     "records_updated": 22
+   }
+   ```
+
+   Failures return a JSON error payload and do not rethrow within the Function runtime, so they surface immediately to the caller.
+
+> ℹ️ Set `MANUAL_SYNC_CONTAINER` in your configuration if the blobs live outside the default `data` container.
 
 ---
 

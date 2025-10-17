@@ -32,29 +32,38 @@ def parse_ztdwr_file(content: bytes) -> pd.DataFrame:
         logging.warning("UTF-8 decode failed, falling back to Latin-1")
         text = content.decode('latin-1')
 
-    # Detect delimiter (tab or pipe)
+    # Detect delimiter (supports multi-character custom delimiters)
     first_line = text.split('\n')[0]
-    if '\t' in first_line:
+    if '\t' in first_line and '~|^' not in first_line:
         delimiter = '\t'
+        engine = 'c'
+    elif '~|^' in first_line:
+        delimiter = r'~\|\^'
+        engine = 'python'  # regex separator requires Python engine
     elif '|' in first_line:
         delimiter = '|'
+        engine = 'c'
     else:
-        # Default to tab
         delimiter = '\t'
+        engine = 'c'
 
-    logging.info(f"Detected delimiter: {repr(delimiter)}")
+    logging.info(f"Detected delimiter: {repr(delimiter)} (engine={engine})")
 
     # Parse with pandas
     df = pd.read_csv(
         io.StringIO(text),
         sep=delimiter,
+        engine=engine,
         dtype=str,  # Read all as string initially
-        na_values=['', 'NULL', 'null', 'None'],
+        na_values=['', 'NULL', 'null', 'None', '~'],
         keep_default_na=False
     )
 
     # Strip whitespace from all string columns
     df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
+
+    # Normalize column names to lowercase snake_case for downstream processing
+    df.columns = [col.strip().lower() for col in df.columns]
 
     logging.info(f"Parsed {len(df)} rows, {len(df.columns)} columns")
     logging.info(f"Columns: {list(df.columns)}")

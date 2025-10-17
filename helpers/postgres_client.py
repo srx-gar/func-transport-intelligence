@@ -60,14 +60,17 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
 
         logging.info(f"Upserting {len(values)} records to transport_documents")
 
-        # Build column list (excluding spb_id from update)
-        update_cols = [col for col in columns if col not in ['spb_id', 'created_at']]
+        # Build column list (excluding primary key from update)
+        update_cols = [
+            col for col in columns
+            if col not in ['surat_pengantar_barang', 'created_at']
+        ]
 
         # Build INSERT ... ON CONFLICT query
         insert_query = f"""
             INSERT INTO transport_documents ({', '.join(columns)})
             VALUES %s
-            ON CONFLICT (spb_id)
+            ON CONFLICT (surat_pengantar_barang)
             DO UPDATE SET
                 {', '.join([f'{col} = EXCLUDED.{col}' for col in update_cols])},
                 updated_at = EXCLUDED.updated_at
