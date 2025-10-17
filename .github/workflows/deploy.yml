@@ -53,13 +53,17 @@ jobs:
                 "DB_NAME=${{ secrets.DB_NAME }}" \
                 "VALIDATION_ERROR_THRESHOLD=0.10" \
                 "ENABLE_MV_REFRESH=true" \
-                "ALERT_EMAIL=${{ secrets.ALERT_EMAIL }}"
+                "ALERT_EMAIL=${{ secrets.ALERT_EMAIL }}" \
+                "SCM_DO_BUILD_DURING_DEPLOYMENT=false" \
+                "ENABLE_ORYX_BUILD=true"
 
       - name: Deploy to Azure Functions
         uses: Azure/functions-action@v1
         with:
           app-name: ${{ env.FUNCTION_APP_NAME }}
           package: .
+          enable-oryx-build: true
+          scm-do-build-during-deployment: false
 
       # Commented out: Function needs time to initialize after deployment
       # - name: Health check
