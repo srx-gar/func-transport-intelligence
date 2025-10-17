@@ -60,7 +60,6 @@ jobs:
         with:
           app-name: ${{ env.FUNCTION_APP_NAME }}
           package: .
-          remote-build: true
 
       # Commented out: Function needs time to initialize after deployment
       # - name: Health check
