@@ -8,8 +8,8 @@ from psycopg2 import sql
 import pandas as pd
 import os
 import logging
-import json
-from datetime import datetime
+import re
+import numpy as np
 
 
 def get_postgres_connection():
@@ -22,16 +22,97 @@ def get_postgres_connection():
     if conn_str:
         conn = psycopg2.connect(conn_str)
     else:
+        host = os.getenv('DB_HOST', 'localhost')
+        port = os.getenv('DB_PORT', '5432')
+        dbname = os.getenv('DB_NAME')
+        user = os.getenv('DB_USER')
+        password = os.getenv('DB_PASSWORD')
+
+        # Allow explicit override from env (e.g. DB_SSL_MODE=disable/require/verify-full)
+        sslmode = os.getenv('DB_SSL_MODE')
+        if not sslmode:
+            # If pointing to localhost or the Docker-mapped port, disable SSL by default
+            host_lower = (host or '').lower()
+            if host_lower in ('localhost', '127.0.0.1', '::1') or host_lower.endswith('.local') or host_lower.startswith('127.'):
+                sslmode = 'disable'
+            else:
+                sslmode = 'require'
+
         conn = psycopg2.connect(
-            host=os.getenv('DB_HOST'),
-            port=os.getenv('DB_PORT', '5432'),
-            dbname=os.getenv('DB_NAME'),
-            user=os.getenv('DB_USER'),
-            password=os.getenv('DB_PASSWORD'),
-            sslmode='require'
+            host=host,
+            port=port,
+            dbname=dbname,
+            user=user,
+            password=password,
+            sslmode=sslmode
         )
 
     return conn
+
+
+def _canonicalize_colname(col: str) -> str:
+    """Lightweight canonicalization: remove BOM, non-alnum -> underscore, collapse underscores, lowercase."""
+    if col is None:
+        return ''
+    col = str(col)
+    col = col.replace('\ufeff', '')
+    col = col.strip()
+    col = re.sub(r"[^0-9a-zA-Z]+", "_", col)
+    col = re.sub(r"_+", "_", col)
+    return col.strip("_").lower()
+
+
+def _build_insert_query_string(conn, table_schema, table_name, df_columns, pk='surat_pengantar_barang') -> str:
+    """Build and return the INSERT ... ON CONFLICT SQL string (for testing/inspection).
+
+    This function uses psycopg2.sql to properly quote identifiers.
+    It requires an active connection for as_string() when converting SQL objects to text.
+    """
+    if not df_columns:
+        raise ValueError("No columns supplied to build insert query")
+
+    cols_ident = sql.SQL(', ').join(sql.Identifier(c) for c in df_columns)
+    update_cols = [c for c in df_columns if c != pk]
+    if update_cols:
+        updates_sql = sql.SQL(', ').join(
+            sql.SQL("{} = EXCLUDED.{}").format(sql.Identifier(c), sql.Identifier(c)) for c in update_cols
+        )
+    else:
+        updates_sql = sql.SQL('')
+
+    insert_query = sql.SQL(
+        "INSERT INTO {}.{} ({}) VALUES %s ON CONFLICT ({}) DO UPDATE SET {} RETURNING (xmax = 0) AS inserted").format(
+        sql.Identifier(table_schema), sql.Identifier(table_name), cols_ident, sql.Identifier(pk), updates_sql
+    )
+
+    return insert_query.as_string(conn)
+
+
+def _quote_identifier(name: str) -> str:
+    """Return a safely quoted SQL identifier (double quotes, escape internal quotes)."""
+    if name is None:
+        raise ValueError('Identifier name is None')
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def build_insert_query_str_no_conn(table_schema: str, table_name: str, df_columns: list,
+                                   pk: str = 'surat_pengantar_barang') -> str:
+    """Build INSERT ... ON CONFLICT SQL string using safe quoting without a DB connection.
+
+    This is useful for diagnostics or environments where a DB connection isn't available.
+    """
+    if not df_columns:
+        raise ValueError('No columns supplied')
+
+    cols = ', '.join(_quote_identifier(c) for c in df_columns)
+    update_cols = [c for c in df_columns if c != pk]
+    if update_cols:
+        updates = ', '.join(f"{_quote_identifier(c)} = EXCLUDED.{_quote_identifier(c)}" for c in update_cols)
+    else:
+        updates = ''
+
+    insert_q = f"INSERT INTO {_quote_identifier(table_schema)}.{_quote_identifier(table_name)} ({cols}) VALUES %s ON CONFLICT ({_quote_identifier(pk)}) DO UPDATE SET {updates} RETURNING (xmax = 0) AS inserted"
+    return insert_q
 
 
 def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
@@ -58,46 +139,293 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
             """
             SELECT column_name
             FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s
+            WHERE table_schema = %s
+              AND table_name = %s
             ORDER BY ordinal_position
             """,
             (table_schema, table_name)
         )
-        table_columns = {row[0] for row in cursor.fetchall()}
+        table_columns = [row[0] for row in cursor.fetchall()]
+        table_columns_set = set(table_columns)
         if not table_columns:
             raise RuntimeError(f"Table {table_schema}.{table_name} has no columns or does not exist")
 
-        # Intersect DataFrame columns with actual table columns
-        df_columns = [c for c in df.columns.tolist() if c in table_columns]
+        # Build canonical mapping of table column names -> their canonical forms
+        canonical_table_map = {_canonicalize_colname(tc): tc for tc in table_columns}
+
+        # Map incoming df columns to actual table column names using canonicalization
+        mapped_columns = []
+        used_table_cols = set()
+        mapping_issues = []
+        for col in df.columns.tolist():
+            # Defensive cleanup: remove common separator remnants that sometimes remain in header tokens
+            cleaned_col = str(col).replace('~', '').replace('|', '').replace('^', '').strip()
+            if cleaned_col in table_columns_set:
+                mapped = cleaned_col
+            else:
+                canon = _canonicalize_colname(cleaned_col)
+                mapped = canonical_table_map.get(canon)
+            if mapped and mapped not in used_table_cols:
+                # skip invalid identifiers defensively
+                if not re.match(r'^[A-Za-z0-9_]+$', mapped):
+                    mapping_issues.append((col, mapped))
+                else:
+                    mapped_columns.append(mapped)
+                    used_table_cols.add(mapped)
+            else:
+                logging.debug("Dropping/ignoring incoming column '%s' (no match to table) or duplicate mapping", col)
+
+        # Preserve the table's column ordering for INSERT
+        df_columns = [c for c in table_columns if c in mapped_columns]
+
+        # Log any mapping issues
+        if mapping_issues:
+            logging.warning('Some incoming columns mapped to invalid table identifiers and were skipped: %s',
+                            mapping_issues)
+
         if 'surat_pengantar_barang' not in df_columns:
             raise RuntimeError("Primary key column 'surat_pengantar_barang' is missing from payload and/or table")
 
         # Convert DataFrame to list of tuples, replacing NaT/NaN with None
-        df_clean = df[df_columns].where(pd.notnull(df[df_columns]), None)
-        values = [tuple(row) for row in df_clean.to_numpy()]
+        df_clean = df[df_columns].where(pd.notnull(df[df_columns]), None).copy()
+
+        # Normalize cell values to Python-native types compatible with psycopg2.
+        # Use a robust function that handles:
+        # - pandas/NumPy NA types -> None
+        # - pandas.Timestamp / numpy.datetime64 -> Python datetime
+        # - strings containing 'nat' or placeholder tokens ('~','NULL','None') -> None
+        def _normalize_cell(v):
+            # None short-circuit
+            if v is None:
+                return None
+
+            # pd.isna handles NaT/NaN/None
+            try:
+                if pd.isna(v):
+                    return None
+            except Exception:
+                pass
+
+            # pandas Timestamp -> py datetime
+            if isinstance(v, pd.Timestamp):
+                try:
+                    return v.to_pydatetime()
+                except Exception:
+                    return None
+
+            # numpy datetime64 -> py datetime
+            if isinstance(v, np.datetime64):
+                try:
+                    return pd.to_datetime(v).to_pydatetime()
+                except Exception:
+                    return None
+
+            # Strings: treat empty/placeholder/NAT-like values as None
+            if isinstance(v, (bytes, bytearray)):
+                try:
+                    v = v.decode('utf-8', errors='ignore')
+                except Exception:
+                    v = str(v)
+
+            if isinstance(v, str):
+                s = v.strip()
+                if s == '':
+                    return None
+                low = s.lower()
+                if low in {'~', 'null', 'none', 'nat'}:
+                    return None
+                # if 'nat' appears anywhere, treat as missing
+                if 'nat' in low:
+                    return None
+                return s
+
+            return v
+
+        # Use apply with map to avoid FutureWarning for applymap
+        df_clean = df_clean.apply(lambda col: col.map(_normalize_cell))
+
+        # Final sanitization pass: detect any lingering 'NaT' substrings or other NaT-like values
+        # and coerce them to None; also ensure datetime-like values are Python datetimes.
+        nat_issues = []
+        def _final_fix(v):
+            # None/null remains None
+            if v is None:
+                return None
+            # Strings containing nat anywhere -> None
+            if isinstance(v, str) and 'nat' in v.lower():
+                return None
+            # pandas/np NA
+            try:
+                if pd.isna(v):
+                    return None
+            except Exception:
+                pass
+            # pandas Timestamp -> python datetime
+            if isinstance(v, pd.Timestamp):
+                try:
+                    return v.to_pydatetime()
+                except Exception:
+                    return None
+            # numpy datetime64
+            if isinstance(v, np.datetime64):
+                try:
+                    return pd.to_datetime(v).to_pydatetime()
+                except Exception:
+                    return None
+            return v
+
+        # Apply final fix and collect a few issue samples for logging
+        samples = []
+        for col in df_clean.columns:
+            # apply per-column mapping to keep memory usage moderate
+            series = df_clean[col].map(_final_fix)
+            # find samples where replacement occurred
+            mask = df_clean[col].notnull() & series.isnull()
+            if mask.any():
+                idxs = list(series[mask].index[:5])
+                for ii in idxs:
+                    samples.append((ii, col, df_clean.at[ii, col]))
+            df_clean[col] = series
+
+        if samples:
+            logging.warning('Sanitized %d NaT-like cells before upsert; samples: %s', len(samples), samples[:8])
+
+        # Targeted sanitization for datetime-like target columns: coerce string 'NaT' and
+        # unparseable date/time strings to None, and convert parseable strings to Python datetimes.
+        datetime_candidates = [
+            c for c in df_columns if any(k in c for k in ('waktu', 'tanggal', 'date', '_at', 'posting'))
+        ]
+        datetime_issues = []
+        for col in datetime_candidates:
+            if col not in df_clean.columns:
+                continue
+            # If column values are strings, try to parse; if unparseable or contain 'nat', set None
+            def _fix_dt(v):
+                if v is None:
+                    return None
+                # if already python datetime, keep
+                try:
+                    import datetime as _dt
+                    if isinstance(v, _dt.datetime):
+                        return v
+                except Exception:
+                    pass
+                # pandas Timestamp
+                if isinstance(v, pd.Timestamp):
+                    try:
+                        return v.to_pydatetime()
+                    except Exception:
+                        return None
+                # numpy datetime64
+                if isinstance(v, np.datetime64):
+                    try:
+                        return pd.to_datetime(v).to_pydatetime()
+                    except Exception:
+                        return None
+                # strings containing nat anywhere
+                if isinstance(v, str) and 'nat' in v.lower():
+                    return None
+                # attempt parsing strings
+                if isinstance(v, str):
+                    parsed = pd.to_datetime(v, errors='coerce')
+                    if pd.isna(parsed):
+                        # record issue and return None
+                        datetime_issues.append((col, v))
+                        return None
+                    return parsed.to_pydatetime()
+                # fallback - return as-is
+                return v
+
+            df_clean[col] = df_clean[col].map(_fix_dt)
+
+        if datetime_issues:
+            logging.warning('Datetime parsing issues before upsert (sample 8): %s', datetime_issues[:8])
+
+        # Final defensive coercion: make absolutely sure datetime candidate columns
+        # contain only Python datetimes or None. This prevents string values like
+        # 'NaT' from being sent to Postgres where they would be cast as 'NaT'::timestamp
+        # and cause an error.
+        def _finalize_datetime_cell(v):
+            if v is None:
+                return None
+            # treat strings containing 'nat' (case-insensitive) as missing
+            if isinstance(v, str) and 'nat' in v.lower():
+                return None
+            # already a python datetime
+            try:
+                import datetime as _dt
+                if isinstance(v, _dt.datetime):
+                    return v
+            except Exception:
+                pass
+            # pandas Timestamp
+            if isinstance(v, pd.Timestamp):
+                try:
+                    return v.to_pydatetime()
+                except Exception:
+                    return None
+            # numpy datetime64
+            if isinstance(v, np.datetime64):
+                try:
+                    return pd.to_datetime(v).to_pydatetime()
+                except Exception:
+                    return None
+            # try parsing strings or other types
+            try:
+                parsed = pd.to_datetime(v, errors='coerce')
+                if pd.isna(parsed):
+                    return None
+                return parsed.to_pydatetime()
+            except Exception:
+                return None
+
+        for col in datetime_candidates:
+            if col in df_clean.columns:
+                df_clean[col] = df_clean[col].map(_finalize_datetime_cell)
+
+        # Build the values tuples from the sanitized DataFrame; ensure any lingering
+        # string tokens that look like 'nat' are coerced to None as a last resort.
+        def _final_sanitize_for_sql(x):
+            # pandas/NumPy NA-like
+            try:
+                if pd.isna(x):
+                    return None
+            except Exception:
+                pass
+            # pandas Timestamp -> python datetime
+            if isinstance(x, pd.Timestamp):
+                try:
+                    return x.to_pydatetime()
+                except Exception:
+                    return None
+            # numpy datetime64 -> python datetime
+            if isinstance(x, np.datetime64):
+                try:
+                    return pd.to_datetime(x).to_pydatetime()
+                except Exception:
+                    return None
+            # strings containing 'nat' -> None
+            if isinstance(x, str) and 'nat' in x.lower():
+                return None
+            return x
+
+        values = []
+        for row in df_clean.to_numpy():
+            sanitized_row = tuple(_final_sanitize_for_sql(v) for v in row)
+            values.append(sanitized_row)
 
         logging.info(f"Upserting {len(values)} records to {table_schema}.{table_name} (cols={len(df_columns)})")
 
-        # Build column list and update list (exclude primary key only)
-        update_cols = [col for col in df_columns if col != 'surat_pengantar_barang']
-
-        # Build INSERT ... ON CONFLICT query
-        insert_query = f"""
-            INSERT INTO {table_schema}.{table_name} ({', '.join(df_columns)})
-            VALUES %s
-            ON CONFLICT (surat_pengantar_barang)
-            DO UPDATE SET
-                {', '.join([f"{col} = EXCLUDED.{col}" for col in update_cols])}
-            RETURNING (xmax = 0) AS inserted
-        """
+        # Use the no-conn builder to get a safe query string
+        insert_query_str = build_insert_query_str_no_conn(table_schema, table_name, df_columns, pk='surat_pengantar_barang')
 
         # Execute batch insert with pagination
         batch_size = 1000
         for i in range(0, len(values), batch_size):
-            batch = values[i:i+batch_size]
+            batch = values[i:i + batch_size]
             results = execute_values(
                 cursor,
-                insert_query,
+                insert_query_str,
                 batch,
                 template=None,
                 page_size=batch_size,
@@ -112,7 +440,7 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                     records_updated += 1
 
             logging.info(
-                f"Batch {i//batch_size + 1}: "
+                f"Batch {i // batch_size + 1}: "
                 f"{records_inserted} inserted, {records_updated} updated so far"
             )
 
@@ -131,171 +459,3 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
         conn.close()
 
     return records_inserted, records_updated
-
-
-def refresh_materialized_views():
-    """
-    Refresh all materialized views in the correct dependency order.
-    """
-    conn = get_postgres_connection()
-    cursor = conn.cursor()
-
-    materialized_views = [
-        'mv_alerts',
-        'mv_alert_details',
-        'mv_entities'
-    ]
-
-    try:
-        for mv in materialized_views:
-            logging.info(f"Refreshing {mv}...")
-            # Use CONCURRENTLY to avoid locking (if indexes exist)
-            try:
-                cursor.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {mv}")
-            except psycopg2.Error:
-                # Fallback to non-concurrent if concurrent fails
-                logging.warning(f"Concurrent refresh failed for {mv}, using non-concurrent")
-                cursor.execute(f"REFRESH MATERIALIZED VIEW {mv}")
-
-            conn.commit()
-            logging.info(f"{mv} refreshed successfully")
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"MV refresh failed: {str(e)}")
-        raise
-    finally:
-        cursor.close()
-        conn.close()
-
-
-def _ensure_sync_metadata_table(cursor):
-    """
-    Ensure the sync_metadata table exists in the configured schema. This is a best-effort fallback
-    for environments where migrations haven't been applied.
-    """
-    table_schema = os.getenv('DB_SCHEMA', 'public')
-
-    # Create schema if not exists (safe in many environments)
-    try:
-        cursor.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(table_schema)))
-    except Exception:
-        # If creating schema fails (likely because it already exists or insufficient perms), continue
-        logging.debug("Could not create schema or schema already exists - continuing")
-
-    create_table_sql = sql.SQL("""
-        CREATE TABLE IF NOT EXISTS {}.sync_metadata (
-            id SERIAL PRIMARY KEY,
-            sync_id VARCHAR(80) UNIQUE NOT NULL,
-            file_name VARCHAR(255) NOT NULL,
-            file_path TEXT,
-            file_size_bytes BIGINT,
-            status VARCHAR(20) NOT NULL,
-            started_at TIMESTAMP NOT NULL DEFAULT NOW(),
-            completed_at TIMESTAMP,
-            records_total INTEGER,
-            records_inserted INTEGER,
-            records_updated INTEGER,
-            records_failed INTEGER,
-            error_message TEXT,
-            validation_errors JSONB,
-            created_at TIMESTAMP DEFAULT NOW()
-        )
-    """
-    ).format(sql.Identifier(table_schema))
-
-    try:
-        cursor.execute(create_table_sql)
-        # Create a simple index for status to support queries
-        try:
-            cursor.execute(sql.SQL("CREATE INDEX IF NOT EXISTS idx_sync_metadata_status ON {}.sync_metadata(status)").format(sql.Identifier(table_schema)))
-        except Exception:
-            logging.debug("Could not create index idx_sync_metadata_status - continuing")
-    except Exception as e:
-        logging.warning(f"Failed to ensure sync_metadata table exists: {e}")
-        # re-raise so caller can handle if necessary
-        raise
-
-
-def update_sync_metadata(
-    sync_id: str,
-    file_name: str,
-    file_path: str = None,
-    file_size_bytes: int = None,
-    status: str = 'IN_PROGRESS',
-    records_total: int = None,
-    records_inserted: int = None,
-    records_updated: int = None,
-    records_failed: int = None,
-    error_message: str = None,
-    validation_errors: list = None
-):
-    """
-    Update or insert sync metadata.
-    """
-    conn = get_postgres_connection()
-    cursor = conn.cursor()
-
-    try:
-        # Calculate duration if completing
-        if status in ['SUCCESS', 'FAILED', 'PARTIAL_SUCCESS']:
-            completed_at = datetime.utcnow()
-        else:
-            completed_at = None
-
-        # Convert validation errors to JSONB
-        validation_errors_json = json.dumps(validation_errors) if validation_errors else None
-
-        table_schema = os.getenv('DB_SCHEMA', 'public')
-
-        insert_stmt = f"""
-            INSERT INTO {table_schema}.sync_metadata (
-                sync_id, file_name, file_path, file_size_bytes, status,
-                started_at, completed_at, records_total, records_inserted,
-                records_updated, records_failed, error_message, validation_errors
-            ) VALUES (
-                %s, %s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s::jsonb
-            )
-            ON CONFLICT (sync_id) DO UPDATE SET
-                status = EXCLUDED.status,
-                completed_at = EXCLUDED.completed_at,
-                records_total = COALESCE(EXCLUDED.records_total, {table_schema}.sync_metadata.records_total),
-                records_inserted = COALESCE(EXCLUDED.records_inserted, {table_schema}.sync_metadata.records_inserted),
-                records_updated = COALESCE(EXCLUDED.records_updated, {table_schema}.sync_metadata.records_updated),
-                records_failed = COALESCE(EXCLUDED.records_failed, {table_schema}.sync_metadata.records_failed),
-                error_message = COALESCE(EXCLUDED.error_message, {table_schema}.sync_metadata.error_message),
-                validation_errors = COALESCE(EXCLUDED.validation_errors, {table_schema}.sync_metadata.validation_errors)
-        """
-
-        try:
-            cursor.execute(insert_stmt, (
-                sync_id, file_name, file_path, file_size_bytes, status,
-                completed_at, records_total, records_inserted, records_updated,
-                records_failed, error_message, validation_errors_json
-            ))
-        except psycopg2.errors.UndefinedTable:
-            # Table doesn't exist - try to create it and retry once
-            logging.warning("sync_metadata table not found, attempting to create it and retry")
-            try:
-                _ensure_sync_metadata_table(cursor)
-                conn.commit()
-                # retry the insert
-                cursor.execute(insert_stmt, (
-                    sync_id, file_name, file_path, file_size_bytes, status,
-                    completed_at, records_total, records_inserted, records_updated,
-                    records_failed, error_message, validation_errors_json
-                ))
-            except Exception as e:
-                conn.rollback()
-                logging.error(f"Failed to create/insert into sync_metadata: {e}")
-                raise
-
-        conn.commit()
-        logging.info(f"Sync metadata updated: {sync_id} - {status}")
-
-    except Exception as e:
-        conn.rollback()
-        logging.error(f"Failed to update sync metadata: {str(e)}")
-        raise
-    finally:
-        cursor.close()
-        conn.close()
