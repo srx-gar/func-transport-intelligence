@@ -161,7 +161,45 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
         # Provide a helpful error when attempting a DB upsert without psycopg2
         raise RuntimeError("psycopg2 is not available in the environment; install psycopg2-binary or use --to-db only when the DB driver is installed")
 
-    conn = get_postgres_connection()
+    # Determine target table early so fallback paths can build diagnostic SQL
+    table_schema = os.getenv('DB_SCHEMA', 'public')
+    table_name = os.getenv('DB_TABLE', 'transport_documents')
+    fallback_columns = list(df.columns)
+
+    # Attempt to get a DB connection. If this fails, print a fully-formed
+    # INSERT ... ON CONFLICT query using the incoming DataFrame columns so
+    # developers can inspect the SQL even when the DB is unreachable.
+    try:
+        conn = get_postgres_connection()
+        # Print connection/environment info for debugging so we can verify
+        # the function is talking to the expected DB instance.
+        try:
+            dbg_cursor = conn.cursor()
+            try:
+                dbg_cursor.execute("SELECT current_database(), current_schema(), inet_server_addr(), inet_server_port()")
+                db_info = dbg_cursor.fetchone()
+                # Keep server info at DEBUG level to avoid noisy production logs
+                # debug suppressed: DB connection info
+            except Exception:
+                # inet_server_addr may not be available in all environments; fallback to env vars
+                logging.debug('inet_server_addr not available in this environment')
+                # debug suppressed: DB connection established (env)
+            finally:
+                dbg_cursor.close()
+        except Exception:
+            # silently ignore debug-only fetch failures
+            pass
+    except Exception as conn_exc:
+        # Connection failed; keep a concise warning and skip verbose debug output
+        logging.warning('Could not connect to DB for upsert (will raise): %s', conn_exc)
+        try:
+            insert_query_str = build_insert_query_str_no_conn(table_schema, table_name, fallback_columns, pk='surat_pengantar_barang')
+            # debug suppressed: built fallback INSERT query (no-conn)
+        except Exception as e2:
+            logging.debug('Failed to build fallback insert query: %s', e2)
+        # Re-raise original connection exception so upstream behavior remains unchanged
+        raise
+
     cursor = conn.cursor()
 
     records_inserted = 0
@@ -494,6 +532,26 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
             if col in df_clean.columns:
                 df_clean[col] = df_clean[col].map(_finalize_datetime_cell)
 
+        # Normalize primary key values to remove stray tokens like leading '^' and trailing '~'
+        if 'surat_pengantar_barang' in df_clean.columns:
+            def _normalize_pk(v):
+                if v is None:
+                    return None
+                if isinstance(v, str):
+                    s = v.strip()
+                    # remove any leading '^' characters and trailing '~' characters
+                    while s.startswith('^'):
+                        s = s[1:]
+                    while s.endswith('~'):
+                        s = s[:-1]
+                    s = s.strip()
+                    if s == '':
+                        return None
+                    return s
+                return v
+
+            df_clean['surat_pengantar_barang'] = df_clean['surat_pengantar_barang'].map(_normalize_pk)
+
         # Build the values tuples from the sanitized DataFrame; ensure any lingering
         # string tokens that look like 'nat' are coerced to None as a last resort.
         def _final_sanitize_for_sql(x):
@@ -527,18 +585,72 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
 
         logging.info(f"Upserting {len(values)} records to {table_schema}.{table_name} (cols={len(df_columns)})")
 
+        # DEBUG: Check if any of the primary keys already exist in the database
+        if values:
+            try:
+                # Get first few primary keys from the data
+                pk_col_index = df_columns.index('surat_pengantar_barang')
+                sample_pks = [row[pk_col_index] for row in values[:10]]
+                all_pks = [row[pk_col_index] for row in values]
+
+                # Build canonical forms (alphanumeric only, lowercase) to compare robustly
+                def _canon(pk):
+                    try:
+                        s = str(pk)
+                        s = s.replace('^', '')
+                        s = s.replace('~', '')
+                        s = re.sub(r'[^0-9a-zA-Z]+', '', s)
+                        return s.lower()
+                    except Exception:
+                        return str(pk)
+
+                sample_pks_canon = [_canon(p) for p in sample_pks]
+                all_pks_canon = [_canon(p) for p in all_pks]
+
+                # Query DB for matches using canonicalized comparison on the server side
+                # Use lower(regexp_replace(...,'[^0-9a-zA-Z]','','g')) to strip non-alnum and lowercase
+                cursor.execute(
+                    f"SELECT surat_pengantar_barang, lower(regexp_replace(surat_pengantar_barang, '[^0-9a-zA-Z]+', '', 'g')) as canon FROM {_quote_identifier(table_schema)}.{_quote_identifier(table_name)} "
+                    f"WHERE lower(regexp_replace(surat_pengantar_barang, '[^0-9a-zA-Z]+', '', 'g')) = ANY(%s)",
+                    (sample_pks_canon,)
+                )
+                rows = cursor.fetchall()
+                existing_pks = [r[0] for r in rows]
+                existing_pks_canon = [r[1] for r in rows]
+
+                # Also get total count by canonical match for the whole batch
+                cursor.execute(
+                    f"SELECT COUNT(*) FROM {_quote_identifier(table_schema)}.{_quote_identifier(table_name)} "
+                    f"WHERE lower(regexp_replace(surat_pengantar_barang, '[^0-9a-zA-Z]+', '', 'g')) = ANY(%s)",
+                    (all_pks_canon,)
+                )
+                existing_count = cursor.fetchone()[0]
+
+                # Pre-check found existing_count; do not spam logs with details unless DEBUG enabled
+                # debug suppressed: detailed pre-check stats
+            except Exception as e:
+                logging.warning(f"DEBUG check failed: {e}")
+
         # Use the DB-backed builder to get a safe query string (ensures proper quoting)
         try:
             insert_query_str = _build_insert_query_string(conn, table_schema, table_name, df_columns, pk='surat_pengantar_barang')
+            # debug suppressed: built DB-backed INSERT query
         except Exception:
             # Fallback to no-conn builder if for any reason the conn-backed builder fails
             logging.exception('Failed to build insert query using DB-backed SQL builder; falling back to string builder')
             insert_query_str = build_insert_query_str_no_conn(table_schema, table_name, df_columns, pk='surat_pengantar_barang')
+            # debug suppressed: built no-conn INSERT query
 
         # Execute batch insert with pagination
         batch_size = 1000
         for i in range(0, len(values), batch_size):
             batch = values[i:i + batch_size]
+
+            # Log the query for debugging (only first batch)
+            if i == 0:
+                # Only log the first-batch size at INFO; avoid logging parameter tuples
+                logging.info('Executing upsert first batch (size=%s)', len(batch))
+
             results = execute_values(
                 cursor,
                 insert_query_str,
@@ -549,22 +661,20 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
             )
 
             # Count inserts vs updates
+            batch_inserts = 0
+            batch_updates = 0
             for result in results:
                 if result[0]:  # xmax = 0 means INSERT
                     records_inserted += 1
+                    batch_inserts += 1
                 else:  # xmax != 0 means UPDATE
                     records_updated += 1
+                    batch_updates += 1
 
-            logging.info(
-                f"Batch {i // batch_size + 1}: "
-                f"{records_inserted} inserted, {records_updated} updated so far"
-            )
+            logging.info('Batch %s: %s inserted, %s updated (total so far: %s inserted, %s updated)', i // batch_size + 1, batch_inserts, batch_updates, records_inserted, records_updated)
 
         conn.commit()
-        logging.info(
-            f"Upsert completed: {records_inserted} inserted, "
-            f"{records_updated} updated"
-        )
+        logging.info(f"Upsert completed: {records_inserted} inserted, {records_updated} updated")
 
     except Exception as e:
         conn.rollback()

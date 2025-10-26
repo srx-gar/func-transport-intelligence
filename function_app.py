@@ -7,6 +7,7 @@ import os
 import uuid
 from datetime import datetime
 from typing import Optional
+import sys
 
 import azure.functions as func
 from azure.core.exceptions import ResourceNotFoundError
@@ -24,7 +25,32 @@ from helpers.transformer import transform_to_transport_documents
 from helpers.validator import validate_ztdwr_data
 
 app = func.FunctionApp()
+# Ensure us and local host produce debug logs during development
+logging.basicConfig()
+handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
+handler.setFormatter(formatter)
+root_logger = logging.getLogger()
+if not root_logger.handlers:
+    root_logger.addHandler(handler)
 
+dev_level = os.getenv('DEV_LOG_LEVEL', '').upper()
+if dev_level == 'DEBUG':
+    root_logger.setLevel(logging.DEBUG)
+    # When in debug mode, keep Azure worker logs verbose
+    logging.getLogger('azure').setLevel(logging.DEBUG)
+    logging.getLogger('azure.functions_worker').setLevel(logging.DEBUG)
+    logging.getLogger('azure.functions').setLevel(logging.DEBUG)
+else:
+    # Default to INFO to reduce noisy logs in normal runs
+    root_logger.setLevel(logging.INFO)
+    # Quiet noisy Azure SDK / HTTP logs during normal runs
+    logging.getLogger('azure').setLevel(logging.WARNING)
+    logging.getLogger('azure.functions_worker').setLevel(logging.WARNING)
+    logging.getLogger('azure.functions').setLevel(logging.WARNING)
+    # Also reduce urllib3/requests noise (HTTP client traces)
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.WARNING)
 
 def _run_sync_pipeline(
         *,
@@ -46,6 +72,7 @@ def _run_sync_pipeline(
         blob_size,
     )
 
+    # Persist initial sync metadata
     update_sync_metadata(
         sync_id=sync_id,
         file_name=file_name,
@@ -117,34 +144,83 @@ def _run_sync_pipeline(
 
         # Step 3: Validate source data
         validation_errors = validate_ztdwr_data(df)
-        error_count = len(validation_errors)
-        error_rate = error_count / total_rows if total_rows else 0
 
-        if error_count:
+        # Split validation results into row-level errors and global errors
+        row_level_errors = [e for e in validation_errors if isinstance(e, dict) and 'row' in e]
+        global_errors = [e for e in validation_errors if not (isinstance(e, dict) and 'row' in e)]
+
+        # Count unique failed row (row-level) for error rate calculation
+        failed_row_indices = {e['row'] for e in row_level_errors}
+        failed_rows_count = len(failed_row_indices)
+
+        # Diagnostic logging: show a brief sample of validation errors to aid debugging
+        try:
+            logging.debug("Validation summary: total_rows=%s, row_level_errors=%s, global_errors=%s",
+                          total_rows, len(row_level_errors), len(global_errors))
+            if row_level_errors:
+                logging.debug("Row-level error sample: %s", row_level_errors[:5])
+            if global_errors:
+                logging.debug("Global error sample: %s", global_errors[:5])
+        except Exception:
+            logging.exception('Failed to log validation diagnostic info')
+
+        # If there are global errors (e.g., missing columns), treat them as fatal
+        if global_errors:
+            # Include global error message and a short dump of errors for diagnostics
+            first_msg = None
+            try:
+                first_msg = global_errors[0].get('message', str(global_errors[0])) if isinstance(global_errors[0], dict) else str(global_errors[0])
+            except Exception:
+                first_msg = str(global_errors[0])
+
+            error_msg = (
+                f"Validation failed due to global errors: {first_msg} (global_errors_count={len(global_errors)}, total_rows={total_rows})"
+            )
+            logging.error("Validation stopped: %s; global_errors=%s", error_msg, global_errors[:5])
+            update_sync_metadata(
+                sync_id=sync_id,
+                file_name=file_name,
+                status='FAILED',
+                records_total=total_rows,
+                records_failed=failed_rows_count + len(global_errors),
+                error_message=error_msg,
+                validation_errors=validation_errors,
+            )
+            send_alert_email(sync_id, file_name, error_msg, validation_errors)
+            raise ValueError(error_msg)
+
+        error_rate = failed_rows_count / total_rows if total_rows else 0
+
+        total_issues = failed_rows_count
+        if total_issues:
             logging.warning(
-                "Validation detected %s issues (rate %.2f%%)",
-                error_count,
+                "Validation detected %s row-level issues (rate %.2f%%)",
+                total_issues,
                 error_rate * 100,
             )
 
             threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.10'))
             if error_rate > threshold:
+                # Compose a more informative error message including counts and a small sample of row errors
+                sample_errors = row_level_errors[:5]
                 error_msg = (
-                    f"Validation error rate {error_rate:.2%} exceeds threshold {threshold:.2%}."
+                    f"Validation error rate {error_rate:.2%} exceeds threshold {threshold:.2%} "
+                    f"(failed_rows={failed_rows_count}, total_rows={total_rows}). Sample errors: {sample_errors}"
                 )
                 update_sync_metadata(
                     sync_id=sync_id,
                     file_name=file_name,
                     status='FAILED',
                     records_total=total_rows,
-                    records_failed=error_count,
+                    records_failed=total_issues,
                     error_message=error_msg,
                     validation_errors=validation_errors,
                 )
+                logging.error("Validation threshold exceeded: %s", error_msg)
                 send_alert_email(sync_id, file_name, error_msg, validation_errors)
                 raise ValueError(error_msg)
 
-            invalid_indices = [err['row'] for err in validation_errors if isinstance(err, dict) and 'row' in err]
+            invalid_indices = sorted(failed_row_indices)
             df = df.drop(index=invalid_indices)
             logging.info(
                 "Continuing with %s valid rows after excluding %s invalid",
@@ -166,7 +242,9 @@ def _run_sync_pipeline(
         else:
             logging.info("Materialized view refresh skipped via config")
 
-        status = 'PARTIAL_SUCCESS' if validation_errors else 'SUCCESS'
+        # Finalize status and record counts
+        records_failed = failed_rows_count
+        status = 'PARTIAL_SUCCESS' if records_failed else 'SUCCESS'
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
@@ -174,7 +252,7 @@ def _run_sync_pipeline(
             records_total=total_rows,
             records_inserted=records_inserted,
             records_updated=records_updated,
-            records_failed=error_count,
+            records_failed=records_failed,
             validation_errors=validation_errors if validation_errors else None,
         )
 
@@ -182,7 +260,7 @@ def _run_sync_pipeline(
             send_alert_email(
                 sync_id,
                 file_name,
-                f"Sync completed with {error_count} validation errors",
+                f"Sync completed with {records_failed} validation errors",
                 validation_errors,
                 is_warning=True,
             )
@@ -193,10 +271,10 @@ def _run_sync_pipeline(
             status,
             records_inserted,
             records_updated,
-            error_count,
+            records_failed,
         )
 
-        return {
+        result = {
             'sync_id': sync_id,
             'status': status,
             'trigger': trigger,
@@ -205,8 +283,26 @@ def _run_sync_pipeline(
             'records_total': total_rows,
             'records_inserted': records_inserted,
             'records_updated': records_updated,
-            'records_failed': error_count,
+            'records_failed': records_failed,
         }
+
+        # Print a single-line machine-readable summary to stdout so it's easy to
+        # find in Functions host logs (useful when host suppresses verbose app logs).
+        try:
+            summary = {
+                'sync_id': sync_id,
+                'status': status,
+                'file_name': file_name,
+                'records_total': total_rows,
+                'records_inserted': records_inserted,
+                'records_updated': records_updated,
+                'records_failed': records_failed,
+            }
+            print('SYNC_SUMMARY ' + json.dumps(summary, default=str))
+        except Exception:
+            logging.exception('Failed to print SYNC_SUMMARY')
+
+        return result
 
     except Exception as exc:
         logging.error("Sync %s failed: %s", sync_id, exc, exc_info=True)

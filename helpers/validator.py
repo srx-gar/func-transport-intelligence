@@ -11,10 +11,16 @@ def _normalize_value(value):
     if pd.isna(value):
         return None
     if isinstance(value, str):
-        normalized = value.strip()
-        if normalized in {'', '~', 'NULL', 'null', 'None'}:
+        # Basic cleanup: remove escaped backslashes and surrounding whitespace
+        s = value.replace('\\', '').strip()
+        # Remove leading '^' markers and trailing '~' padding used in some source files
+        while s.startswith('^'):
+            s = s[1:]
+        while s.endswith('~'):
+            s = s[:-1]
+        if s in {'', '~', 'NULL', 'null', 'None'}:
             return None
-        return normalized
+        return s
     return value
 
 
