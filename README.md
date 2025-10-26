@@ -73,10 +73,15 @@ cp local.settings.json.example local.settings.json
     "DB_NAME": "transport_intelligence",
     "VALIDATION_ERROR_THRESHOLD": "0.10",
     "ENABLE_MV_REFRESH": "true",
-    "ALERT_EMAIL": "your-email@company.com"
+    "ALERT_EMAIL": "your-email@company.com",
+    "MANUAL_SYNC_CONTAINER": "data"
   }
 }
 ```
+
+Optional settings:
+- `DB_SCHEMA` (default `public`)
+- `DB_TABLE` (default `transport_documents`)
 
 ### 4. Run Locally
 
@@ -187,7 +192,8 @@ az functionapp config appsettings set \
     "DB_NAME=transport_intelligence" \
     "VALIDATION_ERROR_THRESHOLD=0.10" \
     "ENABLE_MV_REFRESH=true" \
-    "ALERT_EMAIL=ops-team@company.com"
+    "ALERT_EMAIL=ops-team@company.com" \
+    "MANUAL_SYNC_CONTAINER=data"
 ```
 
 ### 3. Enable Managed Identity
@@ -344,12 +350,9 @@ ADD COLUMN IF NOT EXISTS source_file VARCHAR(255);
 CREATE INDEX idx_transport_docs_sync_id ON transport_documents(sync_id);
 ```
 
-### 3. Ensure Unique Constraint
+### 3. Primary Key
 
-```sql
-ALTER TABLE transport_documents
-ADD CONSTRAINT transport_documents_spb_id_unique UNIQUE (spb_id);
-```
+The table migration defines `surat_pengantar_barang` as the primary key. No additional unique constraint is required.
 
 ---
 
@@ -389,14 +392,139 @@ ORDER BY date DESC;
 
 ### Application Insights
 
-View logs in Azure Portal:
-```
-Application Insights → Logs → Run query:
+This project supports Application Insights for structured telemetry (requests, traces, exceptions), live metrics, and diagnostics. The repository's `host.json` already configures sampling to limit telemetry volume:
 
+```json
+{
+  "logging": {
+    "applicationInsights": {
+      "samplingSettings": {
+        "isEnabled": true,
+        "maxTelemetryItemsPerSecond": 20
+      }
+    }
+  }
+}
+```
+
+Below are step-by-step commands and useful queries for the `poc-gar-blocktracker` resource group and the `func-transport-intelligence` Function App.
+
+1) Create an Application Insights component (if not already present)
+
+```bash
+# Variables (customise if needed)
+RG="poc-gar-blocktracker"
+AI_NAME="ai-func-transport-intelligence"
+LOCATION="southeastasia"  # match your Function App region
+
+# Create App Insights
+az monitor app-insights component create \
+  --app "$AI_NAME" \
+  --location "$LOCATION" \
+  --resource-group "$RG" \
+  --application-type web
+```
+
+2) Get the connection string and attach it to the Function App
+
+```bash
+FUNCTION_APP="func-transport-intelligence"
+RG="poc-gar-blocktracker"
+
+# Get the Application Insights connection string
+AI_CONN_STR=$(az monitor app-insights component show \
+  --app "$AI_NAME" --resource-group "$RG" \
+  --query connectionString -o tsv)
+
+# Set the connection string on the Function App
+az functionapp config appsettings set \
+  --name "$FUNCTION_APP" \
+  --resource-group "$RG" \
+  --settings APPLICATIONINSIGHTS_CONNECTION_STRING="$AI_CONN_STR"
+```
+
+Note: newer Function runtimes prefer `APPLICATIONINSIGHTS_CONNECTION_STRING`. If you only have an instrumentation key, you can also set `APPINSIGHTS_INSTRUMENTATIONKEY` (legacy).
+
+3) Verify telemetry and stream logs
+
+- Live log stream (host logs):
+
+```bash
+# Stream host logs in real time
+func azure functionapp logstream "$FUNCTION_APP"
+# or via Azure CLI
+az webapp log tail --name "$FUNCTION_APP" --resource-group "$RG"
+```
+
+- Application Insights live metrics: open the Azure Portal → Application Insights (the component you created) → Live Metrics Stream.
+
+4) Useful Kusto queries (Application Insights Logs)
+
+a) Recent function requests (last 24 hours):
+
+```
+requests
+| where timestamp > ago(24h)
+| where cloud_RoleName == "func-transport-intelligence" or name contains "/api/"
+| project timestamp, name, resultCode, duration, operation_Id
+| order by timestamp desc
+```
+
+b) Traces and log lines containing the pipeline function name:
+
+```
 traces
 | where timestamp > ago(24h)
-| where message contains "ztdwr_sync"
+| where message contains "ztdwr_sync" or message contains "sync_"
+| project timestamp, severityLevel, message, operation_Id
 | order by timestamp desc
+```
+
+c) Exceptions and failed runs:
+
+```
+exceptions
+| where timestamp > ago(24h)
+| project timestamp, type, problemId, outerMessage, innermostMessage, operation_Id
+| order by timestamp desc
+```
+
+d) Correlate traces with a request using operation_Id:
+
+```
+let op = "<operation_Id from requests table>";
+requests | where operation_Id == op
+| join kind=leftouter (
+    traces | where operation_Id == op
+) on operation_Id
+```
+
+5) Tips and diagnostics
+
+- Correlation: The Functions runtime and Application Insights automatically set `operation_Id` for each invocation — use it to correlate requests, traces, and exceptions.
+- Sampling: The `host.json` samplingSettings help control cost/volume. If you need full telemetry for a short time, temporarily disable sampling by updating the `host.json` or setting the `APPLICATIONINSIGHTS_SAMPLING_PERCENTAGE` app setting.
+- Live debugging: Turn on Live Metrics when investigating latency or error spikes. For detailed snapshots of exceptions, enable Snapshot Debugger in Application Insights (note: requires proper SDK/instrumentation and connectivity).
+- Alerts: Create Azure Monitor alerts on failed requests or on a custom log query over Application Insights (for example: alert when exceptions count > 0 in 5m window).
+
+6) Example: Query recent sync runs from `sync_metadata` table (database)
+
+Your app writes run-level metadata to the database table `sync_metadata`. Use this SQL to inspect recent runs:
+
+```sql
+SELECT sync_id, file_name, status, started_at, completed_at, records_total, records_inserted, records_failed
+FROM sync_metadata
+ORDER BY started_at DESC
+LIMIT 50;
+```
+
+7) If you don't see telemetry
+
+- Confirm `APPLICATIONINSIGHTS_CONNECTION_STRING` is present in Function App settings.
+- Confirm the function app is running in a supported runtime and that `host.json` logging settings are not blocking traces.
+- For platform logs, enable App Service logging via:
+
+```bash
+az webapp log config --name "$FUNCTION_APP" --resource-group "$RG" --application-logging true --level Information
 ```
 
 ---
@@ -412,9 +540,12 @@ traces
 | `DB_USER` | Database user | (required) |
 | `DB_PASSWORD` | Database password | (required) |
 | `DB_NAME` | Database name | (required) |
+| `DB_SCHEMA` | DB schema for target table | `public` |
+| `DB_TABLE` | Target table name | `transport_documents` |
 | `VALIDATION_ERROR_THRESHOLD` | Max error rate (0-1) | `0.10` (10%) |
 | `ENABLE_MV_REFRESH` | Refresh MVs after sync | `true` |
 | `ALERT_EMAIL` | Email for failure alerts | `ops-team@company.com` |
+| `MANUAL_SYNC_CONTAINER` | Container for manual sync HTTP | `data` |
 
 ### Function Configuration
 
@@ -475,19 +606,19 @@ psql "host=poc-gar-db.postgres.database.azure.com port=5432 dbname=transport_int
 
 - **Encoding**: UTF-8 or Latin-1
 - **Compression**: Gzip (optional, auto-detected)
-- **Delimiter**: Tab (`\t`) or Pipe (`|`)
+- **Delimiter**: Tab (`\t`), Pipe (`|`), or multi-char `~|^`
 - **Header Row**: Yes (first row)
 
 **Sample**:
 ```
-SPB_ID	WAKTU_TIMBANG_TERIMA	TGL_SPB	DRIVER_NIK	DRIVER_NAME	NOPOL	...
-SPB001	2025-10-16 08:30:00	2025-10-16	DRV001	John Doe	B1234XYZ	...
+SPB_ID\tWAKTU_TIMBANG_TERIMA\tTGL_SPB\tDRIVER_NIK\tDRIVER_NAME\tNOPOL\t...
+SPB001\t2025-10-16 08:30:00\t2025-10-16\tDRV001\tJohn Doe\tB1234XYZ\t...
 ```
 
 **Validation Rules**:
 - `BBM_ACTUAL`: 0 < value ≤ 500
 - `KILOMETER_ACTUAL`: 0 < value ≤ 500
-- `SPB_ID`: Non-null, unique
+- `SPB_ID`: Non-null, unique (mapped to `surat_pengantar_barang`)
 - `WAKTU_TIMBANG_TERIMA`: Valid datetime
 
 ---
@@ -510,7 +641,7 @@ SPB001	2025-10-16 08:30:00	2025-10-16	DRV001	John Doe	B1234XYZ	...
 ## Support
 
 - **GitHub Issues**: https://github.com/srx-gar/func-transport-intelligence/issues
-- **Documentation**: See `/common/technical/architecture/02-data-sync-architecture.md`
+- **Documentation**: See `/02-data-sync-architecture.md`
 - **Ops Team**: ops-team@company.com
 
 ---
@@ -526,3 +657,15 @@ Internal use only - GAR Transport Intelligence Platform
 - **Backend API**: [svc-transport-intelligence](https://github.com/srx-gar/svc-transport-intelligence)
 - **Frontend**: [transport-intelligence](https://github.com/srx-gar/transport-intelligence)
 - **Documentation**: [transport-intelligence-common](https://github.com/srx-gar/transport-intelligence-common)
+
+## Local database setup
+
+If you see errors about missing tables like `sync_metadata`, run the provided SQL to initialize a minimal schema for local development:
+
+psql "$DB_CONN" -f init_db.sql
+
+Where $DB_CONN is a Postgres connection string such as:
+
+postgresql://user:password@localhost:5432/dbname
+
+Alternatively, let the function attempt to create `sync_metadata` at runtime — the code will create the table on first insert if the running user has sufficient privileges.

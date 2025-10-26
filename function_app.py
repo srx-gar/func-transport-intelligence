@@ -23,17 +23,16 @@ from helpers.postgres_client import (
 from helpers.transformer import transform_to_transport_documents
 from helpers.validator import validate_ztdwr_data
 
-
 app = func.FunctionApp()
 
 
 def _run_sync_pipeline(
-    *,
-    file_name: str,
-    blob_path: str,
-    raw_content: bytes,
-    trigger: str,
-    blob_size: Optional[int] = None,
+        *,
+        file_name: str,
+        blob_path: str,
+        raw_content: bytes,
+        trigger: str,
+        blob_size: Optional[int] = None,
 ) -> dict:
     """Execute the end-to-end sync pipeline and return a summary result."""
 
@@ -230,12 +229,12 @@ def manual_sync(req: func.HttpRequest) -> func.HttpResponse:
         payload = {}
 
     blob_identifier = (
-        payload.get('blob_path')
-        or payload.get('blob_name')
-        or payload.get('file_name')
-        or req.params.get('blob_path')
-        or req.params.get('blob_name')
-        or req.params.get('file_name')
+            payload.get('blob_path')
+            or payload.get('blob_name')
+            or payload.get('file_name')
+            or req.params.get('blob_path')
+            or req.params.get('blob_name')
+            or req.params.get('file_name')
     )
 
     if not blob_identifier:
@@ -246,9 +245,9 @@ def manual_sync(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     container = (
-        payload.get('container')
-        or req.params.get('container')
-        or os.getenv('MANUAL_SYNC_CONTAINER', 'data')
+            payload.get('container')
+            or req.params.get('container')
+            or os.getenv('MANUAL_SYNC_CONTAINER', 'data')
     )
 
     if '/' in blob_identifier:

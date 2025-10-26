@@ -11,6 +11,7 @@
     "DB_NAME": "transport_intelligence",
     "VALIDATION_ERROR_THRESHOLD": "0.10",
     "ENABLE_MV_REFRESH": "true",
-    "ALERT_EMAIL": "ops-team@company.com"
+    "ALERT_EMAIL": "ops-team@company.com",
+    "MANUAL_SYNC_CONTAINER": "data"
   }
 }

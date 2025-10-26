@@ -2,6 +2,7 @@
 
 import logging
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 
@@ -133,6 +134,22 @@ def _decimal_value(value):
         return None
 
 
+def _int_value(value):
+    normalized = _normalize_value(value)
+    if normalized is None:
+        return None
+    if isinstance(normalized, int):
+        return normalized
+    # Convert from decimal-like strings safely
+    dec = _decimal_value(normalized)
+    if dec is None:
+        return None
+    try:
+        return int(round(dec))
+    except Exception:
+        return None
+
+
 def _bool_value(value):
     normalized = _normalize_value(value)
     if normalized is None:
@@ -187,7 +204,7 @@ def _normalize_time_component(value):
     return None
 
 
-def _combine_datetime_series(df: pd.DataFrame, date_col: str, time_col: str | None = None) -> pd.Series:
+def _combine_datetime_series(df: pd.DataFrame, date_col: str, time_col: Optional[str] = None) -> pd.Series:
     if date_col not in df.columns:
         return pd.Series([pd.NaT] * len(df), index=df.index)
 
@@ -289,7 +306,7 @@ def transform_to_transport_documents(
     transformed['nomor_work_order'] = _get_series(df, 'nomor_work_order', _string_value)
     transformed['no_work_order_operation'] = _get_series(df, 'no_work_order_operation', _string_value)
     transformed['no_konfirmasi'] = _get_series(df, 'no_konfirmasi', _string_value)
-    transformed['konfirmasi_counter'] = _get_series(df, 'konfirmasi_counter', _decimal_value)
+    transformed['konfirmasi_counter'] = _get_series(df, 'konfirmasi_counter', _int_value)
     transformed['konfirmasi_posting_date'] = _combine_datetime_series(df, 'konfirmasi_posting_date')
     transformed['posting_date_gi'] = _combine_datetime_series(df, 'posting_date_gi')
     transformed['good_issue_document'] = _get_series(df, 'good_issue_document', _string_value)
