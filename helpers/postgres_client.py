@@ -127,6 +127,65 @@ def build_insert_query_str_no_conn(table_schema: str, table_name: str, df_column
     return insert_q
 
 
+def _strip_caret_tilde(s: str) -> str:
+    """Strip leading '^' characters and trailing '~' characters from a string and trim whitespace.
+
+    This is intentionally conservative: it only removes caret (^) characters at the
+    start and tilde (~) characters at the end. It does not remove these characters
+    if they appear in the middle of the string.
+    """
+    if s is None:
+        return s
+    try:
+        s2 = str(s)
+    except Exception:
+        return s
+    # Strip outer whitespace first, then remove markers, then trim again
+    s2 = s2.strip()
+    # remove all leading '^'
+    while s2.startswith('^'):
+        s2 = s2[1:]
+    # remove all trailing '~'
+    while s2.endswith('~'):
+        s2 = s2[:-1]
+    return s2.strip()
+
+
+def normalize_prefixed_tilde(value):
+    """Recursively normalize a value by stripping leading '^' and trailing '~' from strings.
+
+    - If value is a dict, returns a new dict with the same keys and normalized values.
+    - If value is a list/tuple/set, returns a list of normalized items (tuples/sets are converted to lists).
+    - If value is bytes/bytearray, decode then normalize the resulting string.
+    - If value is a string, strip leading '^' and trailing '~' and trim; if the result is empty, return None.
+    - Otherwise, return the original value.
+
+    This helper is useful when ingesting payloads that include marker tokens like '^...~'.
+    """
+    # dict
+    if isinstance(value, dict):
+        return {k: normalize_prefixed_tilde(v) for k, v in value.items()}
+    # list/tuple/set -> list
+    if isinstance(value, (list, tuple, set)):
+        return [normalize_prefixed_tilde(v) for v in value]
+    # bytes -> decode
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            s = value.decode('utf-8', errors='ignore')
+        except Exception:
+            s = str(value)
+        s = _strip_caret_tilde(s)
+        return s if s != '' else None
+    # string
+    if isinstance(value, str):
+        s = _strip_caret_tilde(value)
+        if s == '':
+            return None
+        return s
+    # fallback
+    return value
+
+
 def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
     """
     Upsert DataFrame to PostgreSQL using INSERT ... ON CONFLICT.
@@ -377,7 +436,9 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                     v = str(v)
 
             if isinstance(v, str):
-                s = v.strip()
+                # Normalize and strip marker tokens like leading '^' and trailing '~'
+                s = _strip_caret_tilde(v)
+                s = s.strip()
                 if s == '':
                     return None
                 low = s.lower()
@@ -538,12 +599,19 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                 if v is None:
                     return None
                 if isinstance(v, str):
-                    s = v.strip()
-                    # remove any leading '^' characters and trailing '~' characters
-                    while s.startswith('^'):
-                        s = s[1:]
-                    while s.endswith('~'):
-                        s = s[:-1]
+                    # use shared helper to remove leading '^' and trailing '~'
+                    s = _strip_caret_tilde(v)
+                    s = s.strip()
+                    if s == '':
+                        return None
+                    return s
+                # bytes
+                if isinstance(v, (bytes, bytearray)):
+                    try:
+                        s = v.decode('utf-8', errors='ignore')
+                    except Exception:
+                        s = str(v)
+                    s = _strip_caret_tilde(s)
                     s = s.strip()
                     if s == '':
                         return None
@@ -574,8 +642,14 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                 except Exception:
                     return None
             # strings containing 'nat' -> None
-            if isinstance(x, str) and 'nat' in x.lower():
-                return None
+            if isinstance(x, str):
+                # Strip marker tokens first
+                sx = _strip_caret_tilde(x)
+                if 'nat' in sx.lower():
+                    return None
+                if sx == '':
+                    return None
+                return sx
             return x
 
         values = []
@@ -597,8 +671,8 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                 def _canon(pk):
                     try:
                         s = str(pk)
-                        s = s.replace('^', '')
-                        s = s.replace('~', '')
+                        # use helper to remove marker tokens before canonicalization
+                        s = _strip_caret_tilde(s)
                         s = re.sub(r'[^0-9a-zA-Z]+', '', s)
                         return s.lower()
                     except Exception:
