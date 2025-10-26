@@ -10,6 +10,7 @@ import os
 import logging
 import re
 import numpy as np
+import difflib
 
 
 def get_postgres_connection():
@@ -157,14 +158,38 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
         mapped_columns = []
         used_table_cols = set()
         mapping_issues = []
+        # Common token-level abbreviation expansions (left intentionally small; extend as needed)
+        ABBREV_MAP = {
+            'brg': 'barang',
+            'tgl': 'tanggal',
+            'wkt': 'waktu',
+            'no': 'nomor',
+            'qty': 'quantity',
+            'std': 'standard',
+            'kbm': 'kilometer',
+        }
         for col in df.columns.tolist():
             # Defensive cleanup: remove common separator remnants that sometimes remain in header tokens
             cleaned_col = str(col).replace('~', '').replace('|', '').replace('^', '').strip()
+            # Quick exact match (after simple cleanup)
             if cleaned_col in table_columns_set:
                 mapped = cleaned_col
             else:
+                # Tokenize and expand known abbreviations to increase match probability
                 canon = _canonicalize_colname(cleaned_col)
-                mapped = canonical_table_map.get(canon)
+                tokens = canon.split('_') if canon else []
+                expanded_tokens = [ABBREV_MAP.get(t, t) for t in tokens]
+                expanded = '_'.join(expanded_tokens)
+                # Try direct canonical mapping first, then expanded form
+                mapped = canonical_table_map.get(canon) or canonical_table_map.get(expanded)
+                # If still not found, try fuzzy matching against canonical table keys
+                if not mapped:
+                    candidate_keys = list(canonical_table_map.keys())
+                    # get_close_matches works on strings; use a moderate cutoff
+                    close = difflib.get_close_matches(canon, candidate_keys, n=1, cutoff=0.8)
+                    if close:
+                        mapped = canonical_table_map.get(close[0])
+                        logging.warning("Fuzzy-mapped incoming column '%s' -> '%s'", col, mapped)
             if mapped and mapped not in used_table_cols:
                 # skip invalid identifiers defensively
                 if not re.match(r'^[A-Za-z0-9_]+$', mapped):
@@ -177,6 +202,28 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
 
         # Preserve the table's column ordering for INSERT
         df_columns = [c for c in table_columns if c in mapped_columns]
+
+        # Defensive validation: ensure df_columns are valid SQL identifiers.
+        # Some incoming header tokens can contain stray characters (e.g. '~') that
+        # slipped through earlier normalization; make a final pass to drop or
+        # remap non-matching items so we don't generate malformed SQL.
+        valid_cols = []
+        for c in df_columns:
+            # Allow only simple identifier characters (letters, digits, underscore)
+            if re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', c):
+                valid_cols.append(c)
+                continue
+            # Try canonical mapping as a best-effort remediation
+            canon = _canonicalize_colname(c)
+            remap = canonical_table_map.get(canon)
+            if remap and re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', remap):
+                logging.warning("Remapping column '%s' -> '%s' to produce safe identifier", c, remap)
+                valid_cols.append(remap)
+                continue
+            logging.warning("Dropping column '%s' from INSERT because it is not a valid SQL identifier", c)
+
+        # Use the validated column list
+        df_columns = valid_cols
 
         # Log any mapping issues
         if mapping_issues:
