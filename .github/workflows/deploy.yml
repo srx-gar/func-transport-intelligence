@@ -55,11 +55,33 @@ jobs:
                 "ENABLE_MV_REFRESH=true" \
                 "ALERT_EMAIL=${{ secrets.ALERT_EMAIL }}"
 
-      - name: Deploy to Azure Functions
-        uses: Azure/functions-action@v1
+      - name: Create zip package
+        run: |
+          zip -r functionapp.zip . -x ".git/*" ".github/*" "venv/*" ".venv/*" "__pycache__/*" "*.pyc" "functionapp.zip" "logs/*"
+
+      - name: Deploy zip to Azure Function (zip deploy)
+        uses: azure/cli@v2
         with:
-          app-name: ${{ env.FUNCTION_APP_NAME }}
-          package: .
+          inlineScript: |
+            az functionapp deployment source config-zip \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --name ${{ env.FUNCTION_APP_NAME }} \
+              --src functionapp.zip
+
+      - name: Restart Function App
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            az functionapp restart --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.FUNCTION_APP_NAME }}
+
+      - name: Confirm app settings and deployments
+        uses: azure/cli@v2
+        with:
+          inlineScript: |
+            echo "--- App settings ---"
+            az functionapp config appsettings list --name ${{ env.FUNCTION_APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }}
+            echo "--- Deployments ---"
+            az webapp deployment list --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.FUNCTION_APP_NAME }}
 
       # Commented out: Function needs time to initialize after deployment
       # - name: Health check
