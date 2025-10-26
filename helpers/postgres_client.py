@@ -2,9 +2,20 @@
 PostgreSQL database operations
 """
 
-import psycopg2
-from psycopg2.extras import execute_values
-from psycopg2 import sql
+# psycopg2 is an optional runtime dependency for local dry-run / testing.
+# Import it lazily and fall back to no-op stubs when unavailable so the
+# function_app and local runner can be imported without a compiled driver.
+try:
+    import psycopg2
+    from psycopg2.extras import execute_values
+    from psycopg2 import sql
+    PSYCOPG_AVAILABLE = True
+except Exception:
+    psycopg2 = None
+    execute_values = None
+    sql = None
+    PSYCOPG_AVAILABLE = False
+
 import pandas as pd
 import os
 import logging
@@ -126,6 +137,10 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
         logging.warning("Empty DataFrame, skipping upsert")
         return (0, 0)
 
+    if not PSYCOPG_AVAILABLE:
+        # Provide a helpful error when attempting a DB upsert without psycopg2
+        raise RuntimeError("psycopg2 is not available in the environment; install psycopg2-binary or use --to-db only when the DB driver is installed")
+
     conn = get_postgres_connection()
     cursor = conn.cursor()
 
@@ -199,6 +214,35 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                     used_table_cols.add(mapped)
             else:
                 logging.debug("Dropping/ignoring incoming column '%s' (no match to table) or duplicate mapping", col)
+
+        # Build a rename map from original incoming column names -> mapped table column names
+        # so we can safely select and preserve ordering. This ensures DataFrame columns match
+        # the DB column identifiers used in the INSERT statement.
+        rename_map = {}
+        used = set()
+        for orig_col in df.columns.tolist():
+            cleaned_col = str(orig_col).replace('~', '').replace('|', '').replace('^', '').strip()
+            # Try to find the mapped table column for this original column
+            # Reuse same matching strategy as above but prefer exact mapped_columns membership
+            mapped = None
+            if cleaned_col in table_columns_set and cleaned_col not in used:
+                mapped = cleaned_col
+            else:
+                canon = _canonicalize_colname(cleaned_col)
+                mapped = canonical_table_map.get(canon)
+                if not mapped:
+                    # expand abbreviations
+                    tokens = canon.split('_') if canon else []
+                    expanded_tokens = [ABBREV_MAP.get(t, t) for t in tokens]
+                    expanded = '_'.join(expanded_tokens)
+                    mapped = canonical_table_map.get(expanded)
+            if mapped and mapped not in used:
+                rename_map[orig_col] = mapped
+                used.add(mapped)
+
+        if rename_map:
+            logging.info('Renaming incoming DataFrame columns for upsert: %s', list(rename_map.items())[:20])
+            df = df.rename(columns=rename_map)
 
         # Preserve the table's column ordering for INSERT
         df_columns = [c for c in table_columns if c in mapped_columns]
@@ -463,8 +507,13 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
 
         logging.info(f"Upserting {len(values)} records to {table_schema}.{table_name} (cols={len(df_columns)})")
 
-        # Use the no-conn builder to get a safe query string
-        insert_query_str = build_insert_query_str_no_conn(table_schema, table_name, df_columns, pk='surat_pengantar_barang')
+        # Use the DB-backed builder to get a safe query string (ensures proper quoting)
+        try:
+            insert_query_str = _build_insert_query_string(conn, table_schema, table_name, df_columns, pk='surat_pengantar_barang')
+        except Exception:
+            # Fallback to no-conn builder if for any reason the conn-backed builder fails
+            logging.exception('Failed to build insert query using DB-backed SQL builder; falling back to string builder')
+            insert_query_str = build_insert_query_str_no_conn(table_schema, table_name, df_columns, pk='surat_pengantar_barang')
 
         # Execute batch insert with pagination
         batch_size = 1000
@@ -506,3 +555,127 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
         conn.close()
 
     return records_inserted, records_updated
+
+
+def update_sync_metadata(sync_id: str, file_name: str = None, file_path: str = None,
+                         file_size_bytes: int = None, status: str = None,
+                         records_total: int = None, records_inserted: int = None,
+                         records_updated: int = None, records_failed: int = None,
+                         error_message: str = None, validation_errors: list = None):
+    """Update or insert a sync metadata record.
+
+    In environments where psycopg2 is not available (local dry-run), this will
+    log the metadata instead of performing DB operations. When psycopg2 is
+    available, it will perform a simple upsert into a table `sync_metadata`
+    if that table exists (best-effort).
+    """
+    payload = {
+        'sync_id': sync_id,
+        'file_name': file_name,
+        'file_path': file_path,
+        'file_size_bytes': file_size_bytes,
+        'status': status,
+        'records_total': records_total,
+        'records_inserted': records_inserted,
+        'records_updated': records_updated,
+        'records_failed': records_failed,
+        'error_message': error_message,
+        'validation_errors_count': len(validation_errors) if validation_errors else 0,
+    }
+    logging.info('update_sync_metadata: %s', payload)
+
+    if not PSYCOPG_AVAILABLE:
+        return
+
+    # Best-effort DB persistence: try to insert into a table named sync_metadata
+    try:
+        conn = get_postgres_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sync_metadata (
+                sync_id TEXT PRIMARY KEY,
+                file_name TEXT,
+                file_path TEXT,
+                file_size_bytes BIGINT,
+                status TEXT,
+                records_total INTEGER,
+                records_inserted INTEGER,
+                records_updated INTEGER,
+                records_failed INTEGER,
+                error_message TEXT,
+                validation_errors_count INTEGER,
+                updated_at TIMESTAMP DEFAULT now()
+            )
+            """
+        )
+        cur.execute(
+            """
+            INSERT INTO sync_metadata (sync_id, file_name, file_path, file_size_bytes, status,
+                records_total, records_inserted, records_updated, records_failed,
+                error_message, validation_errors_count, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT (sync_id) DO UPDATE SET
+                file_name = EXCLUDED.file_name,
+                file_path = EXCLUDED.file_path,
+                file_size_bytes = EXCLUDED.file_size_bytes,
+                status = EXCLUDED.status,
+                records_total = EXCLUDED.records_total,
+                records_inserted = EXCLUDED.records_inserted,
+                records_updated = EXCLUDED.records_updated,
+                records_failed = EXCLUDED.records_failed,
+                error_message = EXCLUDED.error_message,
+                validation_errors_count = EXCLUDED.validation_errors_count,
+                updated_at = now()
+            """,
+            (
+                sync_id, file_name, file_path, file_size_bytes, status,
+                records_total, records_inserted, records_updated, records_failed,
+                error_message, len(validation_errors) if validation_errors else 0
+            )
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as exc:
+        logging.exception('Failed to persist sync metadata to DB: %s', exc)
+
+
+
+def refresh_materialized_views():
+    """Refresh materialized views used by the pipeline.
+
+    When psycopg2 is not available, log the intent. When available, attempt to
+    refresh views named in the environment variable `MATERIALIZED_VIEWS` (comma-separated),
+    falling back to a default list if not supplied.
+    """
+    logging.info('refresh_materialized_views invoked')
+    if not PSYCOPG_AVAILABLE:
+        logging.info('psycopg2 not available; skipping materialized view refresh in local dry-run')
+        return
+
+    views = os.getenv('MATERIALIZED_VIEWS')
+    if views:
+        view_list = [v.strip() for v in views.split(',') if v.strip()]
+    else:
+        # sensible default (no-op if these don't exist)
+        view_list = ['transport_documents_mv']
+
+    try:
+        conn = get_postgres_connection()
+        cur = conn.cursor()
+        for v in view_list:
+            logging.info('Refreshing materialized view: %s', v)
+            # Try CONCURRENTLY first
+            try:
+                cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {v}")
+            except Exception:
+                # Fallback to non-CONCURRENTLY
+                logging.warning('Could not refresh concurrently, falling back to non-CONCURRENTLY for %s', v)
+                cur.execute(f"REFRESH MATERIALIZED VIEW {v}")
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as exc:
+        logging.exception('Failed to refresh materialized views: %s', exc)
+
