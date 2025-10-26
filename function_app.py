@@ -256,7 +256,7 @@ def healthz(req: func.HttpRequest) -> func.HttpResponse:
         db_status = f"unhealthy: {exc}"
 
     return func.HttpResponse(
-        body=json.dumps({"status": "ok", "database": db_status}),
+        body=json.dumps({"status": "ok", "database": db_status, "timestamp": datetime.utcnow().isoformat()}),
         status_code=200,
         mimetype="application/json",
     )
