@@ -80,8 +80,8 @@ jobs:
           inlineScript: |
             echo "--- App settings ---"
             az functionapp config appsettings list --name ${{ env.FUNCTION_APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }}
-            echo "--- Deployment source ---"
-            az functionapp deployment source show --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.FUNCTION_APP_NAME }}
+            echo "--- Deployments ---"
+            az webapp deployment list --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.FUNCTION_APP_NAME }}
 
       # Commented out: Function needs time to initialize after deployment
       # - name: Health check
