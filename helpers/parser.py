@@ -58,10 +58,16 @@ def parse_ztdwr_file(content: bytes) -> pd.DataFrame:
 
     # Detect delimiter (supports multi-character custom delimiters)
     first_line = text.split('\n')[0]
-    if '\t' in first_line and '~|^' not in first_line:
+
+    # Normalize escaped backslashes so we detect sequences like "~\|\^" as well as "~|^"
+    normalized_first_line = first_line.replace('\\', '')
+
+    if '\t' in first_line and '~|^' not in normalized_first_line:
         delimiter = '\t'
         engine = 'c'
-    elif '~|^' in first_line:
+    # Support both the plain token sequence ~|^ and escaped variants like ~\|\^
+    elif '~|^' in normalized_first_line:
+        # Use a regex separator that matches the literal sequence ~|^
         delimiter = r'~\|\^'
         engine = 'python'  # regex separator requires Python engine
     elif '|' in first_line:
@@ -85,6 +91,26 @@ def parse_ztdwr_file(content: bytes) -> pd.DataFrame:
 
     # Strip whitespace from all string columns
     df = df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
+
+    # Pre-clean raw header tokens to remove stray delimiter artifacts such as leading '^' or trailing '~'
+    try:
+        raw_headers = list(df.columns)
+        cleaned_headers = []
+        for h in raw_headers:
+            s = str(h)
+            # Remove escaped backslashes, leading ^ markers and trailing ~ markers from raw headers
+            s = s.replace('\\', '')
+            s = s.strip()
+            if s.startswith('^'):
+                s = s.lstrip('^')
+            if s.endswith('~'):
+                s = s.rstrip('~')
+            cleaned_headers.append(s)
+        df.columns = cleaned_headers
+        logging.debug(f"Pre-cleaned headers: {cleaned_headers}")
+    except Exception:
+        # If anything goes wrong, fall back to using the original df.columns
+        pass
 
     # Normalize column names to lowercase snake_case for downstream processing
     # First perform a best-effort canonicalization of raw headers

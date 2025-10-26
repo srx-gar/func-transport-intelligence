@@ -137,6 +137,26 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
         logging.warning("Empty DataFrame, skipping upsert")
         return (0, 0)
 
+    # Defensive pre-clean: sanitize incoming DataFrame column tokens which may contain
+    # stray delimiter artifacts (e.g. '^tanggal_buat~' or 'surat_pengantar_brg~') coming
+    # from source headers in case parser normalization wasn't applied in the runtime.
+    try:
+        cleaned_cols = []
+        for c in df.columns.tolist():
+            s = str(c)
+            s = s.replace('\\', '')
+            s = s.strip()
+            if s.startswith('^'):
+                s = s.lstrip('^')
+            if s.endswith('~'):
+                s = s.rstrip('~')
+            cleaned_cols.append(s)
+        df = df.copy()
+        df.columns = cleaned_cols
+        logging.debug('Pre-cleaned DataFrame columns for upsert: %s', cleaned_cols[:20])
+    except Exception:
+        logging.exception('Failed to pre-clean DataFrame columns; proceeding with original column names')
+
     if not PSYCOPG_AVAILABLE:
         # Provide a helpful error when attempting a DB upsert without psycopg2
         raise RuntimeError("psycopg2 is not available in the environment; install psycopg2-binary or use --to-db only when the DB driver is installed")
@@ -678,4 +698,3 @@ def refresh_materialized_views():
         conn.close()
     except Exception as exc:
         logging.exception('Failed to refresh materialized views: %s', exc)
-
