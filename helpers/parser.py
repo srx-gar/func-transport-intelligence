@@ -26,8 +26,12 @@ def _canonicalize_column_name(col: str) -> str:
     """
     if col is None:
         return ''
+    # Ensure we operate on a string and remove common BOM/control characters
+    col = str(col)
+    # Remove ZERO WIDTH NO-BREAK SPACE (BOM) if present and other non-printables
+    col = col.replace('\ufeff', '')
     # strip surrounding whitespace and control characters
-    col = str(col).strip()
+    col = col.strip()
     # Replace sequences of non-alphanumeric characters with underscore
     col = re.sub(r"[^0-9a-zA-Z]+", "_", col)
     # Collapse multiple underscores
@@ -84,6 +88,13 @@ def parse_ztdwr_file(content: bytes) -> pd.DataFrame:
 
     # Normalize column names to lowercase snake_case for downstream processing
     # First perform a best-effort canonicalization of raw headers
+    # Log original headers for easier debugging when mapping fails
+    try:
+        original_cols = list(df.columns)
+        logging.debug(f"Original headers: {original_cols}")
+    except Exception:
+        original_cols = []
+
     df.columns = [_canonicalize_column_name(col) for col in df.columns]
 
     # Map common alternative headers to canonical names expected by validator/transformer

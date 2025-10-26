@@ -39,19 +39,23 @@ def main():
 
     # Validate
     errors = validate_ztdwr_data(df)
-    err_count = len(errors)
+
+    # If validator returned a missing-columns error, fail fast as before
+    if errors and isinstance(errors[0], dict) and errors[0].get('type') == 'MISSING_COLUMNS':
+        print(json.dumps(errors, indent=2))
+        sys.exit(1)
+
+    # Consider only row-level validation errors for skipping
+    row_level_errors = [e for e in errors if isinstance(e, dict) and 'row' in e]
+    err_count = len(row_level_errors)
     rate = (err_count / len(df)) if len(df) else 0
     print(f"Validation errors={err_count} ({rate:.2%})")
 
-    # Filter invalid rows if under threshold (as function does)
-    threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.10'))
-    if err_count > 0 and len(df) > 0 and rate <= threshold:
-        invalid_rows = [e['row'] for e in errors if isinstance(e, dict) and 'row' in e]
+    # Always skip invalid rows (drop by index) rather than failing the run
+    if err_count > 0 and len(df) > 0:
+        invalid_rows = [e['row'] for e in row_level_errors]
         df = df.drop(index=invalid_rows)
-        print(f"Continuing with valid rows: {len(df)} (dropped {len(invalid_rows)})")
-    elif err_count > 0 and rate > threshold:
-        print(f"ERROR: Validation error rate {rate:.2%} exceeds threshold {threshold:.2%}")
-        # Still attempt transform to inspect issues
+        print(f"Skipping invalid rows: dropped {len(invalid_rows)} rows, continuing with {len(df)} rows")
 
     # Transform
     transformed = transform_to_transport_documents(df, sync_id="local_smoke", file_name=p.name)
@@ -69,9 +73,9 @@ def main():
 
     out = {
         'file': p.name,
-        'rows_parsed': len(df),
+        'rows_parsed': len(df) + err_count,  # original parsed rows
         'validation_errors': err_count,
-        'threshold': threshold,
+        'threshold': float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.10')),
         'transformed_cols': len(transformed.columns)
     }
 

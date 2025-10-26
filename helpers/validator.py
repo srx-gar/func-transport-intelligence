@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 
 import pandas as pd
+import re
 
 
 def _normalize_value(value):
@@ -76,10 +77,82 @@ def _combine_datetime(date_value, time_value=None):
     return pd.to_datetime(f"{date_str} {time_str}", errors='coerce')
 
 
+def _canonicalize_colname(col: str) -> str:
+    """Lightweight canonicalization for column names (BOM removal, non-alnum -> underscore, lower).
+
+    This mirrors the logic in helpers.parser but avoids importing it to keep modules decoupled.
+    """
+    if col is None:
+        return ''
+    col = str(col)
+    col = col.replace('\ufeff', '')
+    col = col.strip()
+    col = re.sub(r"[^0-9a-zA-Z]+", "_", col)
+    col = re.sub(r"_+", "_", col)
+    return col.strip("_").lower()
+
+
 def validate_ztdwr_data(df: pd.DataFrame) -> list:
-    """Validate ZTDWR data quality."""
+    """Validate ZTDWR data quality.
+
+    This function returns a list of error dictionaries. Row-level errors include a 'row' key
+    with the original DataFrame index so callers can drop/skip those rows if desired.
+    """
 
     errors = []
+
+    # Defensive normalization / aliasing of column names so validator accepts common variants
+    try:
+        original_cols = list(df.columns)
+        logging.debug("Validator original columns: %s", original_cols)
+    except Exception:
+        original_cols = []
+
+    alias_map = {
+        # SPB / surat pengantar
+        'spb_id': 'surat_pengantar_brg',
+        'spb': 'surat_pengantar_brg',
+        'surat_pengantar': 'surat_pengantar_brg',
+        'surat_pengantar_brg': 'surat_pengantar_brg',
+
+        # Driver / NIK
+        'driver_nik': 'nik_supir',
+        'driverid': 'nik_supir',
+        'nik_supir': 'nik_supir',
+        'niksupir': 'nik_supir',
+
+        # No polisi variants
+        'nopol': 'no_polisi',
+        'no_pol': 'no_polisi',
+        'no_polisi': 'no_polisi',
+
+        # Kilometer and BBM
+        'kilometer_actual': 'kilometer_actual',
+        'kilometer_act': 'kilometer_actual',
+        'kilometer': 'kilometer_actual',
+        'bbm_actual': 'bbm_actual',
+        'bbm': 'bbm_actual',
+
+        # Waktu / tanggal timbang (accept several naming schemes)
+        'waktu_timbang_terima': 'jam_timbang',
+        'waktu_timbang': 'jam_timbang',
+        'jam_timbang': 'jam_timbang',
+        'tanggal_timbang': 'tanggal_timbang',
+        'tanggal_timbang_terima': 'tanggal_timbang',
+        'tanggal_tim': 'tanggal_timbang',
+    }
+
+    # Build rename mapping from original column names to canonical expected names
+    rename_map = {}
+    for orig in original_cols:
+        canon = _canonicalize_colname(orig)
+        mapped = alias_map.get(canon, canon)
+        if mapped != orig:
+            rename_map[orig] = mapped
+
+    if rename_map:
+        logging.info("Validator renaming columns using aliases: %s", rename_map)
+        df = df.rename(columns=rename_map)
 
     required_columns = {
         'surat_pengantar_brg',
@@ -122,6 +195,7 @@ def validate_ztdwr_data(df: pd.DataFrame) -> list:
         bbm = _parse_decimal(row.get('bbm_actual'))
         km = _parse_decimal(row.get('kilometer_actual'))
 
+        # strict bbm validation: must be >0 and <=500
         if bbm is None or not (0 < bbm <= 500):
             row_errors.append(f'bbm_actual invalid: {row.get("bbm_actual")!r}')
 
