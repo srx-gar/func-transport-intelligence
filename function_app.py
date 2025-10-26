@@ -67,6 +67,49 @@ def _run_sync_pipeline(
             content = raw_content
             logging.info("Payload is plain text (%s bytes)", len(content))
 
+        # Defensive quick-fix: sanitize the header line (first line) to remove
+        # stray delimiter artefacts that sometimes appear in source files
+        # (tokens like '^colname~' or 'colname~' or '\\' escaping). This only
+        # operates on the first line and preserves the rest of the payload.
+        try:
+            if isinstance(content, (bytes, bytearray)):
+                # work with bytes to avoid encoding assumptions
+                parts = content.split(b"\n", 1)
+                header = parts[0]
+                rest = parts[1] if len(parts) > 1 else b''
+                # split on pipe which is the inner separator of the ~|^ pattern
+                header_tokens = header.split(b"|")
+                cleaned_tokens = []
+                for t in header_tokens:
+                    s = t.replace(b"\\", b"")
+                    s = s.strip()
+                    # remove leading ^ characters and trailing ~ characters
+                    while s.startswith(b"^"):
+                        s = s[1:]
+                    while s.endswith(b"~"):
+                        s = s[:-1]
+                    cleaned_tokens.append(s)
+                new_header = b"|".join(cleaned_tokens)
+                content = new_header + b"\n" + rest
+                logging.info("Sanitized header (preview): %s", new_header[:200])
+            else:
+                # text str
+                parts = content.split('\n', 1)
+                header = parts[0]
+                rest = parts[1] if len(parts) > 1 else ''
+                header_tokens = header.split('|')
+                cleaned_tokens = []
+                for t in header_tokens:
+                    s = t.replace('\\', '')
+                    s = s.strip()
+                    s = s.lstrip('^').rstrip('~')
+                    cleaned_tokens.append(s)
+                new_header = '|'.join(cleaned_tokens)
+                content = new_header + '\n' + rest
+                logging.info("Sanitized header (preview): %s", new_header[:200])
+        except Exception:
+            logging.exception('Failed to sanitize header; continuing with original content')
+
         # Step 2: Parse raw text into a DataFrame
         df = parse_ztdwr_file(content)
         total_rows = len(df)
