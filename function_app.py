@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 import sys
 
@@ -50,7 +50,6 @@ else:
     logging.getLogger('azure.functions').setLevel(logging.WARNING)
     # Also reduce urllib3/requests noise (HTTP client traces)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
-    logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.WARNING)
 
 def _run_sync_pipeline(
         *,
@@ -62,7 +61,7 @@ def _run_sync_pipeline(
 ) -> dict:
     """Execute the end-to-end sync pipeline and return a summary result."""
 
-    sync_id = f"sync_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    sync_id = f"sync_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     logging.info(
         "Starting sync %s (trigger=%s, file=%s, path=%s, size=%s)",
         sync_id,
@@ -352,7 +351,7 @@ def healthz(req: func.HttpRequest) -> func.HttpResponse:
         db_status = f"unhealthy: {exc}"
 
     return func.HttpResponse(
-        body=json.dumps({"status": "ok", "database": db_status, "timestamp": datetime.utcnow().isoformat()}),
+        body=json.dumps({"status": "ok", "database": db_status, "timestamp": datetime.now(timezone.utc).isoformat()}),
         status_code=200,
         mimetype="application/json",
     )

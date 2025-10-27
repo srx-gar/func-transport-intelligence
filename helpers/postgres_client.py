@@ -773,6 +773,8 @@ def update_sync_metadata(sync_id: str, file_name: str = None, file_path: str = N
     available, it will perform a simple upsert into a table `sync_metadata`
     if that table exists (best-effort).
     """
+    # Compute validation errors count and prepare a JSON payload for the DB when present
+    validation_errors_count = len(validation_errors) if validation_errors else 0
     payload = {
         'sync_id': sync_id,
         'file_name': file_name,
@@ -784,64 +786,206 @@ def update_sync_metadata(sync_id: str, file_name: str = None, file_path: str = N
         'records_updated': records_updated,
         'records_failed': records_failed,
         'error_message': error_message,
-        'validation_errors_count': len(validation_errors) if validation_errors else 0,
+        'validation_errors_count': validation_errors_count,
     }
     logging.info('update_sync_metadata: %s', payload)
+    # Ensure db_info exists in all code paths for later diagnostic printing
+    db_info = None
+
+    # Build a DB-friendly representation of the full validation errors (if any).
+    # Prefer psycopg2.extras.Json adapter when available so the DB receives proper JSONB value;
+    # otherwise fall back to a JSON string.
+    validation_errors_param = None
+    if validation_errors_count > 0:
+        try:
+            from psycopg2.extras import Json as _Json
+            validation_errors_param = _Json(validation_errors)
+        except Exception:
+            try:
+                import json as _json
+                validation_errors_param = _json.dumps(validation_errors)
+            except Exception:
+                validation_errors_param = None
 
     if not PSYCOPG_AVAILABLE:
-        return
+        # Try a runtime import fallback in case psycopg2 was not available at module import
+        try:
+            import importlib
+            _psycopg2 = importlib.import_module('psycopg2')
+            globals()['psycopg2'] = _psycopg2
+            # Attempt to also bring in extras if present (not strictly required for this function)
+            try:
+                globals()['execute_values'] = importlib.import_module('psycopg2.extras').execute_values
+            except Exception:
+                pass
+            try:
+                globals()['sql'] = importlib.import_module('psycopg2.sql')
+            except Exception:
+                pass
+            globals()['PSYCOPG_AVAILABLE'] = True
+            logging.debug('psycopg2 imported at runtime in update_sync_metadata')
+        except Exception:
+            logging.debug('psycopg2 not available at runtime; sync_metadata will not be persisted')
+            return
 
     # Best-effort DB persistence: try to insert into a table named sync_metadata
     try:
+        # Establish a DB connection and emit some debug info so we can verify the
+        # target DB instance (mirrors the diagnostic behaviour in upsert_to_postgres)
         conn = get_postgres_connection()
+        try:
+            dbg_cursor = conn.cursor()
+            # ensure db_info is always defined for later diagnostics
+            db_info = None
+            try:
+                dbg_cursor.execute("SELECT current_database(), current_schema(), inet_server_addr(), inet_server_port()")
+                db_info = dbg_cursor.fetchone()
+                logging.debug('Connected to DB: %s', db_info)
+            except Exception:
+                logging.debug('inet_server_addr not available in this environment')
+            finally:
+                dbg_cursor.close()
+        except Exception:
+            # If debug-only fetch fails, silently continue; we still have a live conn
+            pass
+
         cur = conn.cursor()
+
+        # Respect configured DB schema to avoid creating the table in the wrong schema
+        table_schema = os.getenv('DB_SCHEMA', 'public') or 'public'
+        schema_table = f"{_quote_identifier(table_schema)}.{_quote_identifier('sync_metadata')}"
+
+        # Create table if not exists in the configured schema
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS sync_metadata (
-                sync_id TEXT PRIMARY KEY,
-                file_name TEXT,
-                file_path TEXT,
-                file_size_bytes BIGINT,
-                status TEXT,
-                records_total INTEGER,
-                records_inserted INTEGER,
-                records_updated INTEGER,
-                records_failed INTEGER,
-                error_message TEXT,
-                validation_errors_count INTEGER,
-                updated_at TIMESTAMP DEFAULT now()
-            )
-            """
+            f"CREATE TABLE IF NOT EXISTS {schema_table} ("
+            "sync_id TEXT PRIMARY KEY, "
+            "file_name TEXT, "
+            "file_path TEXT, "
+            "file_size_bytes BIGINT, "
+            "status TEXT, "
+            "records_total INTEGER, "
+            "records_inserted INTEGER, "
+            "records_updated INTEGER, "
+            "records_failed INTEGER, "
+            "error_message TEXT, "
+            "validation_errors_count INTEGER, "
+            "updated_at TIMESTAMP DEFAULT now()"
+            ")"
         )
+
+        # Ensure any historical tables missing newer columns get altered to include them.
+        try:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+                (table_schema, 'sync_metadata')
+            )
+            existing_cols = {r[0] for r in cur.fetchall()}
+        except Exception:
+            existing_cols = set()
+
+        expected_columns = {
+            'sync_id': 'TEXT',
+            'file_name': 'TEXT',
+            'file_path': 'TEXT',
+            'file_size_bytes': 'BIGINT',
+            'status': 'TEXT',
+            'records_total': 'INTEGER',
+            'records_inserted': 'INTEGER',
+            'records_updated': 'INTEGER',
+            'records_failed': 'INTEGER',
+            'error_message': 'TEXT',
+            'validation_errors_count': 'INTEGER',
+            # new: full JSONB column to store the validation error details
+            'validation_errors': 'JSONB',
+            'updated_at': 'TIMESTAMP DEFAULT now()',
+        }
+
+        for col, col_type in expected_columns.items():
+            if col not in existing_cols:
+                try:
+                    # Use ALTER TABLE ... ADD COLUMN IF NOT EXISTS where supported
+                    cur.execute(f"ALTER TABLE {schema_table} ADD COLUMN IF NOT EXISTS {_quote_identifier(col)} {col_type}")
+                    logging.info('Added missing column to sync_metadata: %s', col)
+                except Exception as e:
+                    logging.warning('Failed to add column %s to %s: %s', col, schema_table, e)
+
+        # Now perform the upsert into the sync_metadata table (schema-qualified).
+        # Include the full validation_errors payload when present (as JSONB). If the
+        # Json adapter was created above, pass it directly; otherwise pass a JSON string
+        # or NULL.
         cur.execute(
-            """
-            INSERT INTO sync_metadata (sync_id, file_name, file_path, file_size_bytes, status,
-                records_total, records_inserted, records_updated, records_failed,
-                error_message, validation_errors_count, updated_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-            ON CONFLICT (sync_id) DO UPDATE SET
-                file_name = EXCLUDED.file_name,
-                file_path = EXCLUDED.file_path,
-                file_size_bytes = EXCLUDED.file_size_bytes,
-                status = EXCLUDED.status,
-                records_total = EXCLUDED.records_total,
-                records_inserted = EXCLUDED.records_inserted,
-                records_updated = EXCLUDED.records_updated,
-                records_failed = EXCLUDED.records_failed,
-                error_message = EXCLUDED.error_message,
-                validation_errors_count = EXCLUDED.validation_errors_count,
-                updated_at = now()
-            """,
+            f"INSERT INTO {schema_table} (sync_id, file_name, file_path, file_size_bytes, status, "
+            "records_total, records_inserted, records_updated, records_failed, "
+            "error_message, validation_errors_count, validation_errors, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now()) "
+            "ON CONFLICT (sync_id) DO UPDATE SET "
+            "file_name = EXCLUDED.file_name, "
+            "file_path = EXCLUDED.file_path, "
+            "file_size_bytes = EXCLUDED.file_size_bytes, "
+            "status = EXCLUDED.status, "
+            "records_total = EXCLUDED.records_total, "
+            "records_inserted = EXCLUDED.records_inserted, "
+            "records_updated = EXCLUDED.records_updated, "
+            "records_failed = EXCLUDED.records_failed, "
+            "error_message = EXCLUDED.error_message, "
+            "validation_errors_count = EXCLUDED.validation_errors_count, "
+            "validation_errors = EXCLUDED.validation_errors, "
+            "updated_at = now()",
             (
                 sync_id, file_name, file_path, file_size_bytes, status,
                 records_total, records_inserted, records_updated, records_failed,
-                error_message, len(validation_errors) if validation_errors else 0
+                error_message, validation_errors_count, validation_errors_param
             )
         )
-        conn.commit()
-        cur.close()
-        conn.close()
+
+        # Log result of the insert/upsert for diagnostics
+        try:
+            logging.info('sync_metadata upsert affected rows: %s', cur.rowcount)
+        except Exception:
+            logging.debug('Could not read cursor.rowcount after sync_metadata upsert')
+
+        # Commit and close, but also emit a single-line machine-readable summary
+        try:
+            conn.commit()
+            # Print to stdout so Azure Functions host includes it reliably in logs
+            try:
+                import json as _json
+                payload_short = {
+                    'sync_id': sync_id,
+                    'status': status,
+                    'file_name': file_name,
+                    'records_total': records_total,
+                    'records_inserted': records_inserted,
+                    'records_updated': records_updated,
+                    'records_failed': records_failed,
+                }
+                # Include a brief DB info tag when available
+                db_tag = None
+                try:
+                    if 'db_info' in locals() and db_info:
+                        db_tag = db_info
+                except Exception:
+                    db_tag = None
+                print('SYNC_METADATA ' + _json.dumps({'payload': payload_short, 'db_info': db_tag}, default=str))
+            except Exception:
+                # Fallback to logging if printing fails
+                logging.info('sync_metadata upsert committed for sync_id=%s', sync_id)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
     except Exception as exc:
+        # Emit a concise failure line to stdout for easier discovery in host logs
+        try:
+            import json as _json
+            print('SYNC_METADATA_ERROR ' + _json.dumps({'sync_id': sync_id, 'error': str(exc)}))
+        except Exception:
+            pass
         logging.exception('Failed to persist sync metadata to DB: %s', exc)
 
 
