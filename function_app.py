@@ -24,6 +24,10 @@ from helpers.postgres_client import (
 from helpers.transformer import transform_to_transport_documents
 from helpers.validator import validate_ztdwr_data
 
+# Streaming optimization imports
+from helpers.streaming_parser import parse_ztdwr_chunks, estimate_chunk_size
+from helpers.chunked_processor import ChunkedPipelineProcessor, process_chunks_with_backpressure
+
 app = func.FunctionApp()
 # Ensure us and local host produce debug logs during development
 logging.basicConfig()
@@ -315,6 +319,147 @@ def _run_sync_pipeline(
         raise
 
 
+def _run_streaming_pipeline(
+        *,
+        file_name: str,
+        blob_path: str,
+        raw_content: bytes,
+        trigger: str,
+        blob_size: Optional[int] = None,
+) -> dict:
+    """
+    Execute streaming pipeline for large files.
+    Processes files in chunks to minimize memory usage and prevent timeouts.
+    """
+
+    sync_id = f"sync_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    logging.info(
+        "Starting STREAMING sync %s (trigger=%s, file=%s, path=%s, size=%s MB)",
+        sync_id,
+        trigger,
+        file_name,
+        blob_path,
+        (blob_size or len(raw_content)) / 1024 / 1024,
+    )
+
+    # Persist initial sync metadata
+    update_sync_metadata(
+        sync_id=sync_id,
+        file_name=file_name,
+        file_path=blob_path,
+        file_size_bytes=blob_size or len(raw_content),
+        status='IN_PROGRESS',
+    )
+
+    try:
+        # Determine optimal chunk size based on file size
+        file_size = blob_size or len(raw_content)
+        available_memory_mb = int(os.getenv('MAX_MEMORY_MB', '512'))
+        chunk_size = estimate_chunk_size(file_size, available_memory_mb)
+
+        logging.info(f"Using chunk size: {chunk_size} rows for streaming processing")
+
+        # Get error threshold from config
+        error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.05'))
+
+        # Create chunked processor
+        processor = ChunkedPipelineProcessor(sync_id, file_name, error_threshold)
+
+        # Create chunk iterator - will decompress automatically if needed
+        chunk_iterator = parse_ztdwr_chunks(
+            raw_content,
+            chunk_size=chunk_size,
+            decompress=True
+        )
+
+        # Process chunks with backpressure control
+        max_buffer = int(os.getenv('MAX_BUFFER_CHUNKS', '2'))
+        summary = process_chunks_with_backpressure(
+            chunk_iterator,
+            processor,
+            max_buffer_chunks=max_buffer
+        )
+
+        # Check for processing errors
+        if 'error' in summary:
+            raise RuntimeError(summary['error'])
+
+        # Extract results
+        total_rows = summary['total_rows']
+        records_inserted = summary['records_inserted']
+        records_updated = summary['records_updated']
+        records_failed = summary['failed_rows']
+        validation_errors = summary['validation_errors']
+
+        # Refresh materialized views
+        if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
+            refresh_materialized_views()
+            logging.info("Materialized views refreshed")
+
+        # Determine status
+        status = 'PARTIAL_SUCCESS' if records_failed else 'SUCCESS'
+
+        # Update final metadata
+        update_sync_metadata(
+            sync_id=sync_id,
+            file_name=file_name,
+            status=status,
+            records_total=total_rows,
+            records_inserted=records_inserted,
+            records_updated=records_updated,
+            records_failed=records_failed,
+            validation_errors=validation_errors if validation_errors else None,
+        )
+
+        # Send alerts if needed
+        if validation_errors:
+            send_alert_email(
+                sync_id,
+                file_name,
+                f"Sync completed with {records_failed} validation errors",
+                validation_errors,
+                is_warning=True,
+            )
+
+        logging.info(
+            "Streaming sync %s completed (%s): inserted=%s updated=%s errors=%s",
+            sync_id,
+            status,
+            records_inserted,
+            records_updated,
+            records_failed,
+        )
+
+        result = {
+            'sync_id': sync_id,
+            'status': status,
+            'trigger': trigger,
+            'file_name': file_name,
+            'file_path': blob_path,
+            'records_total': total_rows,
+            'records_inserted': records_inserted,
+            'records_updated': records_updated,
+            'records_failed': records_failed,
+            'processing_mode': 'streaming',
+        }
+
+        # Print summary
+        print('SYNC_SUMMARY ' + json.dumps(result, default=str))
+
+        return result
+
+    except Exception as exc:
+        logging.error("Streaming sync %s failed: %s", sync_id, exc, exc_info=True)
+        update_sync_metadata(
+            sync_id=sync_id,
+            file_name=file_name,
+            status='FAILED',
+            error_message=str(exc),
+        )
+        send_alert_email(sync_id, file_name, str(exc))
+        raise
+
+
 @app.blob_trigger(
     arg_name="myblob",
     path="data/hex-ztdwr/{name}",
@@ -327,13 +472,36 @@ def ztdwr_sync(myblob: func.InputStream):
     file_name = myblob.name.split('/')[-1]
     raw_content = myblob.read()
 
-    _run_sync_pipeline(
-        file_name=file_name,
-        blob_path=myblob.name,
-        raw_content=raw_content,
-        trigger='blob',
-        blob_size=myblob.length,
-    )
+    # Determine which pipeline to use based on file size
+    file_size = myblob.length or len(raw_content)
+    file_size_mb = file_size / 1024 / 1024
+
+    # Get threshold from config (default 20MB - conservative for production)
+    threshold_mb = int(os.getenv('STREAMING_THRESHOLD_MB', '20'))
+    use_streaming = os.getenv('ENABLE_STREAMING', 'true').lower() == 'true'
+
+    if use_streaming and file_size_mb > threshold_mb:
+        logging.info(
+            f"File size {file_size_mb:.2f} MB > {threshold_mb} MB threshold, using STREAMING pipeline"
+        )
+        _run_streaming_pipeline(
+            file_name=file_name,
+            blob_path=myblob.name,
+            raw_content=raw_content,
+            trigger='blob',
+            blob_size=myblob.length,
+        )
+    else:
+        logging.info(
+            f"File size {file_size_mb:.2f} MB <= {threshold_mb} MB threshold, using STANDARD pipeline"
+        )
+        _run_sync_pipeline(
+            file_name=file_name,
+            blob_path=myblob.name,
+            raw_content=raw_content,
+            trigger='blob',
+            blob_size=myblob.length,
+        )
 
 
 @app.route(route="healthz", methods=["GET"], auth_level=func.AuthLevel.ANONYMOUS)
@@ -417,13 +585,36 @@ def manual_sync(req: func.HttpRequest) -> func.HttpResponse:
         blob_size = downloader.size or len(raw_content)
         file_name = os.path.basename(blob_path)
 
-        result = _run_sync_pipeline(
-            file_name=file_name,
-            blob_path=f"{container}/{blob_path}",
-            raw_content=raw_content,
-            trigger='http',
-            blob_size=blob_size,
-        )
+        # Determine which pipeline to use based on file size
+        file_size = blob_size or len(raw_content)
+        file_size_mb = file_size / 1024 / 1024
+
+        # Get threshold from config (default 20MB - conservative for production)
+        threshold_mb = int(os.getenv('STREAMING_THRESHOLD_MB', '20'))
+        use_streaming = os.getenv('ENABLE_STREAMING', 'true').lower() == 'true'
+
+        if use_streaming and file_size_mb > threshold_mb:
+            logging.info(
+                f"Manual sync: File size {file_size_mb:.2f} MB > {threshold_mb} MB threshold, using STREAMING pipeline"
+            )
+            result = _run_streaming_pipeline(
+                file_name=file_name,
+                blob_path=f"{container}/{blob_path}",
+                raw_content=raw_content,
+                trigger='http',
+                blob_size=blob_size,
+            )
+        else:
+            logging.info(
+                f"Manual sync: File size {file_size_mb:.2f} MB <= {threshold_mb} MB threshold, using STANDARD pipeline"
+            )
+            result = _run_sync_pipeline(
+                file_name=file_name,
+                blob_path=f"{container}/{blob_path}",
+                raw_content=raw_content,
+                trigger='http',
+                blob_size=blob_size,
+            )
 
         return func.HttpResponse(
             json.dumps(result),
