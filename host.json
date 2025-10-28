@@ -6,12 +6,6 @@
         "isEnabled": true,
         "maxTelemetryItemsPerSecond": 20
       }
-    },
-    "logLevel": {
-      "default": "Information",
-      "Host.Results": "Information",
-      "Function": "Information",
-      "Host.Aggregator": "Information"
     }
   },
   "extensionBundle": {
@@ -24,7 +18,7 @@
     "minimumInterval": "00:00:05",
     "maximumInterval": "00:05:00"
   },
-  "functionTimeout": "00:30:00",
+  "functionTimeout": "00:10:00",
   "extensions": {
     "grpc": {
       "maxReceiveMessageLength": 2147483647,
