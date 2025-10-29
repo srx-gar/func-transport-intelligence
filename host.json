@@ -6,7 +6,23 @@
         "isEnabled": true,
         "maxTelemetryItemsPerSecond": 20
       }
-    }
+    },
+    "logLevel": {
+      "default": "Information",
+      "Host.Results": "Warning",
+      "Host.Aggregator": "Warning",
+      "Host.Triggers.Blob": "Warning",
+      "Host.Triggers": "Warning",
+      "Host.General": "Warning",
+      "Azure.Core": "Error",
+      "Azure.Storage.Blobs": "Error",
+      "Azure.Storage.Queues": "Error",
+      "Function": "Information",
+      "Function.ztdwr_sync": "Information",
+      "Function.manual_sync": "Information",
+      "Function.healthz": "Information"
+    },
+    "fileLoggingMode": "never"
   },
   "extensionBundle": {
     "id": "Microsoft.Azure.Functions.ExtensionBundle",
@@ -23,6 +39,13 @@
     "grpc": {
       "maxReceiveMessageLength": 2147483647,
       "maxSendMessageLength": 2147483647
+    },
+    "http": {
+      "routePrefix": "api",
+      "dynamicThrottlesEnabled": false
     }
+  },
+  "healthMonitor": {
+    "enabled": false
   }
 }

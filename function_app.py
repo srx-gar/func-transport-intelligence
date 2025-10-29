@@ -28,15 +28,24 @@ from helpers.validator import validate_ztdwr_data
 from helpers.streaming_parser import parse_ztdwr_chunks, estimate_chunk_size
 from helpers.chunked_processor import ChunkedPipelineProcessor, process_chunks_with_backpressure
 
-app = func.FunctionApp()
-# Ensure us and local host produce debug logs during development
-logging.basicConfig()
-handler = logging.StreamHandler(sys.stdout)
-formatter = logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s')
-handler.setFormatter(formatter)
+# Configure logging BEFORE creating FunctionApp
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+# Get or create root logger
 root_logger = logging.getLogger()
-if not root_logger.handlers:
+root_logger.setLevel(logging.INFO)
+
+# Ensure we have a stdout handler
+if not any(isinstance(h, logging.StreamHandler) for h in root_logger.handlers):
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s'))
     root_logger.addHandler(handler)
+
+app = func.FunctionApp()
 
 dev_level = os.getenv('DEV_LOG_LEVEL', '').upper()
 if dev_level == 'DEBUG':
@@ -48,12 +57,30 @@ if dev_level == 'DEBUG':
 else:
     # Default to INFO to reduce noisy logs in normal runs
     root_logger.setLevel(logging.INFO)
+
+    # Get Azure SDK log level from config (default: WARNING)
+    azure_log_level = os.getenv('AZURE_LOG_LEVEL', 'WARNING').upper()
+    azure_level = getattr(logging, azure_log_level, logging.WARNING)
+
     # Quiet noisy Azure SDK / HTTP logs during normal runs
-    logging.getLogger('azure').setLevel(logging.WARNING)
+    logging.getLogger('azure').setLevel(azure_level)
     logging.getLogger('azure.functions_worker').setLevel(logging.WARNING)
     logging.getLogger('azure.functions').setLevel(logging.WARNING)
+
+    # Suppress Azure Storage SDK HTTP request/response logs (the noisy ones)
+    logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.ERROR)
+    logging.getLogger('azure.core.pipeline.policies').setLevel(logging.ERROR)
+    logging.getLogger('azure.storage').setLevel(logging.WARNING)
+    logging.getLogger('azure.storage.blob').setLevel(logging.WARNING)
+    logging.getLogger('azure.storage.blob._blob_client').setLevel(logging.ERROR)
+    logging.getLogger('azure.storage.blob._download').setLevel(logging.ERROR)
+    logging.getLogger('azure.storage.queue').setLevel(logging.WARNING)
+    logging.getLogger('azure.storage.queue._queue_client').setLevel(logging.ERROR)
+
     # Also reduce urllib3/requests noise (HTTP client traces)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+    logging.getLogger('requests').setLevel(logging.WARNING)
 
 def _run_sync_pipeline(
         *,
@@ -66,13 +93,17 @@ def _run_sync_pipeline(
     """Execute the end-to-end sync pipeline and return a summary result."""
 
     sync_id = f"sync_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    start_time = datetime.now(timezone.utc)
+
+    logging.info("=" * 80)
+    logging.info("🚀 STARTING STANDARD PIPELINE")
+    logging.info("=" * 80)
     logging.info(
-        "Starting sync %s (trigger=%s, file=%s, path=%s, size=%s)",
+        "Sync ID: %s | File: %s | Size: %s bytes | Trigger: %s",
         sync_id,
-        trigger,
         file_name,
-        blob_path,
         blob_size,
+        trigger,
     )
 
     # Persist initial sync metadata
@@ -87,11 +118,15 @@ def _run_sync_pipeline(
     try:
         # Step 1: Decompress if the payload is gzipped
         if is_gzipped(raw_content):
+            logging.info("🗜️  Decompressing gzipped payload (%s bytes)...", len(raw_content))
+            decompress_start = datetime.now(timezone.utc)
             content = gzip.decompress(raw_content)
+            decompress_duration = (datetime.now(timezone.utc) - decompress_start).total_seconds()
             logging.info(
-                "Decompressed payload from %s bytes to %s bytes",
+                "✅ Decompressed payload from %s bytes to %s bytes in %.2f seconds",
                 len(raw_content),
                 len(content),
+                decompress_duration,
             )
         else:
             content = raw_content
@@ -141,12 +176,19 @@ def _run_sync_pipeline(
             logging.exception('Failed to sanitize header; continuing with original content')
 
         # Step 2: Parse raw text into a DataFrame
+        logging.info("📄 Parsing file content (%s bytes)...", len(content))
+        parse_start = datetime.now(timezone.utc)
         df = parse_ztdwr_file(content)
         total_rows = len(df)
-        logging.info("Parsed %s rows from %s", total_rows, file_name)
+        parse_duration = (datetime.now(timezone.utc) - parse_start).total_seconds()
+        logging.info("✅ Parsed %s rows from %s in %.2f seconds", total_rows, file_name, parse_duration)
 
         # Step 3: Validate source data
+        logging.info("✔️  Validating %s rows...", total_rows)
+        validation_start = datetime.now(timezone.utc)
         validation_errors = validate_ztdwr_data(df)
+        validation_duration = (datetime.now(timezone.utc) - validation_start).total_seconds()
+        logging.info("✅ Validation complete in %.2f seconds", validation_duration)
 
         # Split validation results into row-level errors and global errors
         row_level_errors = [e for e in validation_errors if isinstance(e, dict) and 'row' in e]
@@ -232,11 +274,20 @@ def _run_sync_pipeline(
             )
 
         # Step 4: Transform into target schema
+        logging.info("🔄 Transforming %s rows to target schema...", len(df))
+        transform_start = datetime.now(timezone.utc)
         transformed_df = transform_to_transport_documents(df, sync_id, file_name)
-        logging.info("Transformation produced %s columns", len(transformed_df.columns))
+        transform_duration = (datetime.now(timezone.utc) - transform_start).total_seconds()
+        logging.info("✅ Transformation complete in %.2f seconds, produced %s columns",
+                     transform_duration, len(transformed_df.columns))
 
         # Step 5: Load into PostgreSQL
+        logging.info("💾 Loading %s rows into PostgreSQL...", len(transformed_df))
+        upsert_start = datetime.now(timezone.utc)
         records_inserted, records_updated = upsert_to_postgres(sync_id, transformed_df)
+        upsert_duration = (datetime.now(timezone.utc) - upsert_start).total_seconds()
+        logging.info("✅ Database upsert complete in %.2f seconds (inserted=%s, updated=%s)",
+                     upsert_duration, records_inserted, records_updated)
 
         # Step 6: Refresh dependent materialized views
         if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
@@ -268,13 +319,25 @@ def _run_sync_pipeline(
                 is_warning=True,
             )
 
+        # Calculate performance metrics
+        end_time = datetime.now(timezone.utc)
+        duration_seconds = (end_time - start_time).total_seconds()
+        duration_minutes = duration_seconds / 60
+        rows_per_minute = total_rows / duration_minutes if duration_minutes > 0 else 0
+        rows_per_second = total_rows / duration_seconds if duration_seconds > 0 else 0
+
         logging.info(
-            "Sync %s completed (%s): inserted=%s updated=%s errors=%s",
+            "Sync %s completed (%s): inserted=%s updated=%s errors=%s | "
+            "Performance: %s rows in %.2f min (%.0f rows/min, %.1f rows/sec)",
             sync_id,
             status,
             records_inserted,
             records_updated,
             records_failed,
+            total_rows,
+            duration_minutes,
+            rows_per_minute,
+            rows_per_second,
         )
 
         result = {
@@ -287,6 +350,10 @@ def _run_sync_pipeline(
             'records_inserted': records_inserted,
             'records_updated': records_updated,
             'records_failed': records_failed,
+            'duration_seconds': round(duration_seconds, 2),
+            'duration_minutes': round(duration_minutes, 2),
+            'rows_per_minute': round(rows_per_minute, 2),
+            'rows_per_second': round(rows_per_second, 2),
         }
 
         # Print a single-line machine-readable summary to stdout so it's easy to
@@ -333,13 +400,17 @@ def _run_streaming_pipeline(
     """
 
     sync_id = f"sync_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    start_time = datetime.now(timezone.utc)
+
+    logging.info("=" * 80)
+    logging.info("🚀 STARTING STREAMING PIPELINE")
+    logging.info("=" * 80)
     logging.info(
-        "Starting STREAMING sync %s (trigger=%s, file=%s, path=%s, size=%s MB)",
+        "Sync ID: %s | File: %s | Size: %.2f MB | Trigger: %s",
         sync_id,
-        trigger,
         file_name,
-        blob_path,
         (blob_size or len(raw_content)) / 1024 / 1024,
+        trigger,
     )
 
     # Persist initial sync metadata
@@ -357,13 +428,19 @@ def _run_streaming_pipeline(
         available_memory_mb = int(os.getenv('MAX_MEMORY_MB', '512'))
         chunk_size = estimate_chunk_size(file_size, available_memory_mb)
 
-        logging.info(f"Using chunk size: {chunk_size} rows for streaming processing")
+        # Estimate total chunks
+        estimated_rows = file_size // 1000  # Rough estimate: 1KB per row
+        estimated_chunks = max(1, estimated_rows // chunk_size)
+
+        logging.info(f"📊 Chunk size: {chunk_size} rows | Estimated {estimated_chunks} chunks")
 
         # Get error threshold from config
         error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.05'))
 
         # Create chunked processor
         processor = ChunkedPipelineProcessor(sync_id, file_name, error_threshold)
+
+        logging.info("🔄 Creating chunk iterator and starting processing...")
 
         # Create chunk iterator - will decompress automatically if needed
         chunk_iterator = parse_ztdwr_chunks(
@@ -374,6 +451,9 @@ def _run_streaming_pipeline(
 
         # Process chunks with backpressure control
         max_buffer = int(os.getenv('MAX_BUFFER_CHUNKS', '2'))
+
+        logging.info("⚙️  Processing chunks with backpressure control...")
+
         summary = process_chunks_with_backpressure(
             chunk_iterator,
             processor,
@@ -421,13 +501,25 @@ def _run_streaming_pipeline(
                 is_warning=True,
             )
 
+        # Calculate performance metrics
+        end_time = datetime.now(timezone.utc)
+        duration_seconds = (end_time - start_time).total_seconds()
+        duration_minutes = duration_seconds / 60
+        rows_per_minute = total_rows / duration_minutes if duration_minutes > 0 else 0
+        rows_per_second = total_rows / duration_seconds if duration_seconds > 0 else 0
+
         logging.info(
-            "Streaming sync %s completed (%s): inserted=%s updated=%s errors=%s",
+            "Streaming sync %s completed (%s): inserted=%s updated=%s errors=%s | "
+            "Performance: %s rows in %.2f min (%.0f rows/min, %.1f rows/sec)",
             sync_id,
             status,
             records_inserted,
             records_updated,
             records_failed,
+            total_rows,
+            duration_minutes,
+            rows_per_minute,
+            rows_per_second,
         )
 
         result = {
@@ -439,6 +531,10 @@ def _run_streaming_pipeline(
             'records_total': total_rows,
             'records_inserted': records_inserted,
             'records_updated': records_updated,
+            'duration_seconds': round(duration_seconds, 2),
+            'duration_minutes': round(duration_minutes, 2),
+            'rows_per_minute': round(rows_per_minute, 2),
+            'rows_per_second': round(rows_per_second, 2),
             'records_failed': records_failed,
             'processing_mode': 'streaming',
         }
@@ -468,9 +564,76 @@ def _run_streaming_pipeline(
 def ztdwr_sync(myblob: func.InputStream):
     """Automatically triggered when a new ZTDWR file lands in Azure Storage."""
 
-    logging.info("Blob trigger invoked for %s (%s bytes)", myblob.name, myblob.length)
+    import sys
+
+    # CRITICAL: Force immediate log flushing - log before ANY blocking operations
+    logging.info("=" * 80)
+    logging.info("🚀 FUNCTION STARTED - Blob trigger received")
+    logging.info("=" * 80)
+    sys.stdout.flush()
+    sys.stderr.flush()
+
     file_name = myblob.name.split('/')[-1]
-    raw_content = myblob.read()
+    file_size_mb = (myblob.length or 0) / 1024 / 1024
+
+    logging.info("📋 Blob: %s | Size: %s bytes (%.2f MB)",
+                 file_name, myblob.length, file_size_mb)
+    sys.stdout.flush()
+
+    # Download blob content with progress logging for large files
+    logging.info("📥 Starting blob download... (%.2f MB)", file_size_mb)
+    sys.stdout.flush()
+
+    download_start = datetime.now(timezone.utc)
+
+    # For large files, read in chunks with progress logging
+    if file_size_mb > 10:
+        logging.info("⚠️  Large file detected - using chunked download with progress tracking")
+        sys.stdout.flush()
+
+        chunks = []
+        bytes_downloaded = 0
+        chunk_size = 10 * 1024 * 1024  # 10MB chunks
+        last_log_time = datetime.now(timezone.utc)
+
+        try:
+            while True:
+                chunk = myblob.read(chunk_size)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                bytes_downloaded += len(chunk)
+
+                # Log progress every 10 seconds or 50MB to show function is alive
+                current_time = datetime.now(timezone.utc)
+                if (current_time - last_log_time).total_seconds() > 10 or bytes_downloaded % (50 * 1024 * 1024) < chunk_size:
+                    pct = (bytes_downloaded / myblob.length * 100) if myblob.length else 0
+                    elapsed = (current_time - download_start).total_seconds()
+                    speed_mbps = (bytes_downloaded / 1024 / 1024) / elapsed if elapsed > 0 else 0
+                    logging.info("⏳ Download progress: %.1f%% (%d/%d MB) at %.2f MB/s",
+                                pct, bytes_downloaded // (1024*1024),
+                                (myblob.length or 0) // (1024*1024), speed_mbps)
+                    sys.stdout.flush()
+                    last_log_time = current_time
+
+            raw_content = b''.join(chunks)
+            logging.info("✅ Chunked download complete: %d bytes", len(raw_content))
+            sys.stdout.flush()
+        except Exception as e:
+            logging.error("❌ Download failed: %s", e)
+            sys.stdout.flush()
+            raise
+    else:
+        # Small files - direct read
+        raw_content = myblob.read()
+        logging.info("✅ Direct download complete: %d bytes", len(raw_content))
+        sys.stdout.flush()
+
+    download_duration = (datetime.now(timezone.utc) - download_start).total_seconds()
+    download_speed = (len(raw_content) / 1024 / 1024) / download_duration if download_duration > 0 else 0
+    logging.info("📊 Download summary: %s bytes in %.2f seconds (%.2f MB/s)",
+                 len(raw_content), download_duration, download_speed)
+    sys.stdout.flush()
 
     # Determine which pipeline to use based on file size
     file_size = myblob.length or len(raw_content)
@@ -480,9 +643,15 @@ def ztdwr_sync(myblob: func.InputStream):
     threshold_mb = int(os.getenv('STREAMING_THRESHOLD_MB', '20'))
     use_streaming = os.getenv('ENABLE_STREAMING', 'true').lower() == 'true'
 
+    logging.info(
+        "📊 PIPELINE SELECTION: file_size=%.2f MB, threshold=%d MB, streaming_enabled=%s",
+        file_size_mb, threshold_mb, use_streaming
+    )
+
     if use_streaming and file_size_mb > threshold_mb:
         logging.info(
-            f"File size {file_size_mb:.2f} MB > {threshold_mb} MB threshold, using STREAMING pipeline"
+            "🌊 Selected: STREAMING PIPELINE (file size %.2f MB > %d MB threshold)",
+            file_size_mb, threshold_mb
         )
         _run_streaming_pipeline(
             file_name=file_name,
@@ -492,9 +661,15 @@ def ztdwr_sync(myblob: func.InputStream):
             blob_size=myblob.length,
         )
     else:
-        logging.info(
-            f"File size {file_size_mb:.2f} MB <= {threshold_mb} MB threshold, using STANDARD pipeline"
-        )
+        if not use_streaming:
+            logging.info(
+                "📄 Selected: STANDARD PIPELINE (streaming disabled via config)"
+            )
+        else:
+            logging.info(
+                "📄 Selected: STANDARD PIPELINE (file size %.2f MB <= %d MB threshold)",
+                file_size_mb, threshold_mb
+            )
         _run_sync_pipeline(
             file_name=file_name,
             blob_path=myblob.name,
@@ -508,12 +683,14 @@ def ztdwr_sync(myblob: func.InputStream):
 def healthz(req: func.HttpRequest) -> func.HttpResponse:
     """Simple health check endpoint for uptime probes."""
 
+    # Use logging (no debug print)
     logging.info('Health check requested')
 
     try:
         conn = get_postgres_connection()
         conn.close()
         db_status = "healthy"
+        logging.info('Database connection check: %s', db_status)
     except Exception as exc:
         logging.error("Database health check failed: %s", exc)
         db_status = f"unhealthy: {exc}"

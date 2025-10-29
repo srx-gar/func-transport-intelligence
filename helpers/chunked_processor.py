@@ -4,6 +4,7 @@ Chunked data processing and database operations for memory efficiency.
 
 import logging
 import pandas as pd
+import time
 from typing import Tuple, Iterator, Optional
 from helpers.validator import validate_ztdwr_data
 from helpers.transformer import transform_to_transport_documents
@@ -25,6 +26,11 @@ class ChunkedPipelineProcessor:
         self.records_updated = 0
         self.validation_errors = []
 
+        # Performance tracking
+        self.chunk_count = 0
+        self.start_time = time.time()
+        self.last_chunk_time = time.time()
+
     def process_chunk(self, chunk_df: pd.DataFrame) -> Tuple[int, int]:
         """
         Process a single chunk: validate, transform, and upsert.
@@ -32,10 +38,24 @@ class ChunkedPipelineProcessor:
         Returns:
             (rows_inserted, rows_updated) for this chunk
         """
+        self.chunk_count += 1
         chunk_size = len(chunk_df)
         self.total_rows += chunk_size
 
-        logging.info(f"Processing chunk of {chunk_size} rows (total so far: {self.total_rows})")
+        # Calculate timing and progress
+        current_time = time.time()
+        chunk_duration = current_time - self.last_chunk_time
+        total_duration = current_time - self.start_time
+        avg_chunk_time = total_duration / self.chunk_count if self.chunk_count > 0 else 0
+        rows_per_sec = self.total_rows / total_duration if total_duration > 0 else 0
+
+        logging.info(
+            f"📦 CHUNK {self.chunk_count}: Processing {chunk_size} rows "
+            f"(total: {self.total_rows} rows, {rows_per_sec:.1f} rows/sec, "
+            f"chunk took {chunk_duration:.1f}s)"
+        )
+
+        self.last_chunk_time = current_time
 
         # Step 1: Validate chunk
         chunk_validation_errors = validate_ztdwr_data(chunk_df)
@@ -85,8 +105,9 @@ class ChunkedPipelineProcessor:
         self.records_updated += chunk_updated
 
         logging.info(
-            f"Chunk processed: inserted={chunk_inserted}, updated={chunk_updated} "
-            f"(cumulative: inserted={self.records_inserted}, updated={self.records_updated})"
+            f"✅ CHUNK {self.chunk_count} COMPLETE: +{chunk_inserted} inserted, +{chunk_updated} updated "
+            f"(cumulative: {self.records_inserted} inserted, {self.records_updated} updated, "
+            f"{self.failed_rows} failed)"
         )
 
         return (chunk_inserted, chunk_updated)

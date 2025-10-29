@@ -151,15 +151,19 @@ def parse_ztdwr_chunks(
         chunksize=chunk_size
     )
 
+    chunk_num = 0
     for chunk_df in chunk_iter:
+        chunk_num += 1
         # Apply header mapping
         chunk_df.columns = mapped_headers
 
         # Strip whitespace
         chunk_df = chunk_df.apply(lambda x: x.str.strip() if x.dtype == "object" else x)
 
-        logging.debug(f"Yielding chunk with {len(chunk_df)} rows")
+        logging.info(f"📦 Yielding chunk #{chunk_num} with {len(chunk_df)} rows")
         yield chunk_df
+
+    logging.info(f"✅ Finished parsing all {chunk_num} chunks")
 
 
 def estimate_chunk_size(file_size_bytes: int, available_memory_mb: int = 512) -> int:
