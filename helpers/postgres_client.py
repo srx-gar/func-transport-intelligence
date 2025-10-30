@@ -69,8 +69,9 @@ def get_postgres_connection():
     # This helps detect stuck queries faster
     try:
         cursor = conn.cursor()
-        # Set statement timeout to 5 minutes (300000ms)
-        cursor.execute("SET statement_timeout = '300000'")
+        # Set statement timeout to 10 minutes (600000ms) to handle large batches
+        # Each chunk may have 100K+ rows which takes several minutes to upsert
+        cursor.execute("SET statement_timeout = '600000'")
         cursor.close()
     except Exception as e:
         logging.warning(f"Could not set statement timeout: {e}")
@@ -741,9 +742,21 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
 
         total_batches = (len(values) + batch_size - 1) // batch_size
         logging.info(f"Starting batch upsert: {len(values)} rows in {total_batches} batches of {batch_size}")
+
+        batch_num = 0  # Initialize before loop
         for i in range(0, len(values), batch_size):
             batch = values[i:i + batch_size]
             batch_num = i // batch_size + 1
+
+            # Check connection health every 10 batches
+            if batch_num % 10 == 0:
+                try:
+                    cursor.execute("SELECT 1")
+                    cursor.fetchone()
+                except Exception as conn_check_error:
+                    logging.error(f"❌ Connection health check failed at batch {batch_num}: {conn_check_error}")
+                    sys.stdout.flush()
+                    raise
 
             # Log the query for debugging (only first batch)
             if i == 0:
@@ -761,7 +774,7 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                     fetch=True
                 )
             except Exception as batch_error:
-                logging.error(f"❌ Batch {batch_num}/{total_batches} failed: {batch_error}")
+                logging.error(f"❌ Batch {batch_num}/{total_batches} failed: {batch_error}", exc_info=True)
                 sys.stdout.flush()
                 sys.stderr.flush()
                 raise
@@ -787,6 +800,11 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
             if batch_num % 10 == 0:
                 sys.stdout.flush()
                 sys.stderr.flush()
+
+        # Log immediately after loop exits to confirm completion
+        logging.info(f"🔄 Batch loop completed. Processed {batch_num}/{total_batches} batches successfully.")
+        sys.stdout.flush()
+        sys.stderr.flush()
 
         # All batches executed, now commit
         logging.info(f"✅ All {total_batches} batches executed. Committing transaction...")

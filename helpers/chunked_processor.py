@@ -99,7 +99,15 @@ class ChunkedPipelineProcessor:
         transformed_chunk = transform_to_transport_documents(chunk_df, self.sync_id, self.file_name)
 
         # Step 3: Upsert chunk to database
-        chunk_inserted, chunk_updated = upsert_to_postgres(self.sync_id, transformed_chunk)
+        try:
+            chunk_inserted, chunk_updated = upsert_to_postgres(self.sync_id, transformed_chunk)
+        except Exception as upsert_error:
+            import sys
+            logging.error(f"❌ UPSERT FAILED for chunk {self.chunk_count}: {upsert_error}", exc_info=True)
+            sys.stdout.flush()
+            sys.stderr.flush()
+            # Re-raise to let the chunk processor handle it
+            raise
 
         self.records_inserted += chunk_inserted
         self.records_updated += chunk_updated

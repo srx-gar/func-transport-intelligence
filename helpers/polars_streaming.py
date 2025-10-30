@@ -347,8 +347,10 @@ def estimate_chunk_size_polars(
     # Calculate chunk size
     chunk_size = int(max_chunk_bytes // bytes_per_row)
 
-    # Polars can handle larger chunks: 5000-100000 rows
-    chunk_size = max(5000, min(100000, chunk_size))
+    # Reduce max chunk size to 30K rows to avoid statement timeout
+    # Processing 100K rows was taking 5+ minutes per chunk, exceeding statement timeout
+    # 30K rows should complete in ~90 seconds, well within 10-minute timeout
+    chunk_size = max(5000, min(30000, chunk_size))
 
     logging.info(
         f"📊 Estimated chunk size: {chunk_size:,} rows "
