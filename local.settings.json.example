@@ -18,7 +18,7 @@
     "STREAMING_THRESHOLD_MB": "20",
     "ENABLE_CHECKPOINTING": "true",
     "CHECKPOINT_THRESHOLD_MB": "50",
-    "CHECKPOINT_BASE_PATH": "checkpoints",
+    "CHECKPOINT_BASE_PATH": "/tmp/checkpoints",
     "CHECKPOINT_CLEANUP_ON_SUCCESS": "true",
     "MAX_MEMORY_MB": "512",
     "MAX_BUFFER_CHUNKS": "2",

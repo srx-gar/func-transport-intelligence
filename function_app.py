@@ -695,7 +695,8 @@ def _run_streaming_pipeline_with_checkpoints(
     )
 
     # Initialize checkpoint manager
-    checkpoint_base = os.getenv('CHECKPOINT_BASE_PATH', 'checkpoints')
+    # Azure Functions only allows writes to /tmp directory
+    checkpoint_base = os.getenv('CHECKPOINT_BASE_PATH', '/tmp/checkpoints')
     checkpoint_manager = CheckpointManager(sync_id, file_name, checkpoint_base)
 
     try:

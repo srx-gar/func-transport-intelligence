@@ -290,7 +290,7 @@ def _run_streaming_pipeline_with_checkpoints(
     logging.info("🚀 STARTING STREAMING PIPELINE WITH CHECKPOINTS")
     logging.info("=" * 80)
 
-    checkpoint_base = os.getenv('CHECKPOINT_BASE_PATH', 'checkpoints')
+    checkpoint_base = os.getenv('CHECKPOINT_BASE_PATH', '/tmp/checkpoints')
     checkpoint_manager = CheckpointManager(sync_id, file_name, checkpoint_base)
 
     # PHASE 1: Convert .dat to Parquet Chunks
@@ -482,7 +482,7 @@ if 'surat_pengantar_barang' not in chunk_df.columns:
    ```json
    {
      "ENABLE_CHECKPOINTING": "true",
-     "CHECKPOINT_BASE_PATH": "checkpoints",
+     "CHECKPOINT_BASE_PATH": "/tmp/checkpoints",
      "CHECKPOINT_CLEANUP_ON_SUCCESS": "true",
      "CHECKPOINT_RETENTION_DAYS": "7"
    }
