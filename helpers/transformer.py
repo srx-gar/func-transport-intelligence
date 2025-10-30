@@ -205,30 +205,136 @@ def _normalize_time_component(value):
 
 
 def _combine_datetime_series(df: pd.DataFrame, date_col: str, time_col: Optional[str] = None) -> pd.Series:
+    """Optimized datetime combination using vectorized operations."""
     if date_col not in df.columns:
         return pd.Series([pd.NaT] * len(df), index=df.index)
 
-    def _combine(row):
-        """Combine date and time components. Returns pd.Timestamp or pd.NaT."""
-        date_str = _normalize_date_component(row.get(date_col))
-        if date_str is None:
-            return pd.NaT
+    # Vectorized date parsing
+    date_series = df[date_col].astype(str).str.strip()
 
-        time_value = None
-        if time_col and time_col in row.index:
-            time_value = _normalize_time_component(row.get(time_col))
+    # Handle YYYYMMDD format (8 digits)
+    date_formatted = date_series.copy()
+    is_8digit = date_series.str.match(r'^\d{8}$')
+    if is_8digit.any():
+        date_formatted[is_8digit] = (
+            date_series[is_8digit].str[:4] + '-' +
+            date_series[is_8digit].str[4:6] + '-' +
+            date_series[is_8digit].str[6:8]
+        )
 
-        if time_value:
-            return pd.to_datetime(f"{date_str} {time_value}", errors='coerce')
-        return pd.to_datetime(date_str, errors='coerce')
+    # Parse dates
+    dates = pd.to_datetime(date_formatted, errors='coerce')
 
-    return df.apply(_combine, axis=1)
+    # If no time column, return dates
+    if not time_col or time_col not in df.columns:
+        return dates
+
+    # Vectorized time parsing
+    time_series = df[time_col].astype(str).str.strip().str.replace(':', '')
+
+    # Format time strings
+    time_formatted = pd.Series(['00:00:00'] * len(df), index=df.index)
+
+    # 6 digits: HHMMSS
+    is_6digit = time_series.str.match(r'^\d{6}$') & (time_series != '000000')
+    if is_6digit.any():
+        time_formatted[is_6digit] = (
+            time_series[is_6digit].str[:2] + ':' +
+            time_series[is_6digit].str[2:4] + ':' +
+            time_series[is_6digit].str[4:6]
+        )
+
+    # 4 digits: HHMM
+    is_4digit = time_series.str.match(r'^\d{4}$')
+    if is_4digit.any():
+        time_formatted[is_4digit] = (
+            time_series[is_4digit].str[:2] + ':' +
+            time_series[is_4digit].str[2:4] + ':00'
+        )
+
+    # 2 digits: HH
+    is_2digit = time_series.str.match(r'^\d{2}$')
+    if is_2digit.any():
+        time_formatted[is_2digit] = time_series[is_2digit] + ':00:00'
+
+    # Combine date and time
+    datetime_strings = dates.dt.strftime('%Y-%m-%d') + ' ' + time_formatted
+    result = pd.to_datetime(datetime_strings, errors='coerce')
+
+    # If time was invalid or all zeros, use date only
+    result[dates.notna() & result.isna()] = dates[dates.notna() & result.isna()]
+
+    return result
 
 
 def _get_series(df: pd.DataFrame, column: str, converter, default=None) -> pd.Series:
+    """Optimized series getter with vectorized operations where possible."""
     if column not in df.columns:
         return pd.Series([default] * len(df), index=df.index)
-    return df[column].apply(converter)
+
+    series = df[column]
+
+    # Use vectorized operations for common converters
+    if converter == _string_value:
+        return _vectorized_string_series(series)
+    elif converter == _decimal_value:
+        return _vectorized_decimal_series(series)
+    elif converter == _int_value:
+        return _vectorized_int_series(series)
+    elif converter == _bool_value:
+        return _vectorized_bool_series(series)
+    else:
+        # Fall back to apply for custom converters
+        return series.apply(converter)
+
+
+def _vectorized_string_series(series: pd.Series) -> pd.Series:
+    """Fast vectorized string normalization."""
+    # Replace empty strings and placeholders with None
+    result = series.astype(str).str.strip()
+    result = result.replace(['', '~', 'NULL', 'null', 'None', 'nan'], None)
+    return result
+
+
+def _vectorized_decimal_series(series: pd.Series) -> pd.Series:
+    """Fast vectorized decimal conversion."""
+    # Try direct numeric conversion first
+    result = pd.to_numeric(series, errors='coerce')
+
+    # Handle string decimals with comma separators
+    mask = result.isna() & series.notna()
+    if mask.any():
+        # Convert strings with commas to decimals
+        str_series = series[mask].astype(str).str.strip()
+        # Replace European format (1.234,56 -> 1234.56)
+        str_series = str_series.str.replace(r'\.(?=\d{3})', '', regex=True)
+        str_series = str_series.str.replace(',', '.')
+        result[mask] = pd.to_numeric(str_series, errors='coerce')
+
+    return result
+
+
+def _vectorized_int_series(series: pd.Series) -> pd.Series:
+    """Fast vectorized integer conversion."""
+    # Convert to decimal first, then round to int
+    decimals = _vectorized_decimal_series(series)
+    return decimals.round().astype('Int64')  # Nullable integer type
+
+
+def _vectorized_bool_series(series: pd.Series) -> pd.Series:
+    """Fast vectorized boolean conversion."""
+    # Convert to uppercase strings
+    str_series = series.astype(str).str.strip().str.upper()
+
+    # Map true values
+    result = pd.Series([None] * len(series), index=series.index, dtype='object')
+    true_mask = str_series.isin(TRUE_VALUES)
+    false_mask = str_series.isin(FALSE_VALUES)
+
+    result[true_mask] = True
+    result[false_mask] = False
+
+    return result
 
 
 def transform_to_transport_documents(
@@ -237,8 +343,10 @@ def transform_to_transport_documents(
     file_name: str
 ) -> pd.DataFrame:
     """Transform ZTDWR DataFrame to transport_documents schema."""
+    import time
 
-    logging.info("Starting transformation to transport_documents schema")
+    start_time = time.time()
+    logging.info("Starting transformation to transport_documents schema (%d rows)", len(df))
 
     transformed = pd.DataFrame(index=df.index)
 
@@ -345,10 +453,13 @@ def transform_to_transport_documents(
     transformed['sync_id'] = sync_id
     transformed['source_file'] = file_name
 
+    elapsed = time.time() - start_time
+    rows_per_sec = len(transformed) / elapsed if elapsed > 0 else 0
     logging.info(
-        "Transformed %s records to transport_documents schema (columns=%s)",
+        "✅ Transformed %d records in %.2f seconds (%.0f rows/sec)",
         len(transformed),
-        list(transformed.columns)
+        elapsed,
+        rows_per_sec
     )
 
     return transformed
