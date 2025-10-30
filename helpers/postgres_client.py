@@ -22,6 +22,7 @@ import logging
 import re
 import numpy as np
 import difflib
+from typing import Optional
 
 
 def get_postgres_connection():
@@ -127,7 +128,7 @@ def build_insert_query_str_no_conn(table_schema: str, table_name: str, df_column
     return insert_q
 
 
-def _strip_caret_tilde(s: str) -> str:
+def _strip_caret_tilde(s: str) -> Optional[str]:
     """Strip leading '^' characters and trailing '~' characters from a string and trim whitespace.
 
     This is intentionally conservative: it only removes caret (^) characters at the
