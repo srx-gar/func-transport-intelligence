@@ -1,10 +1,8 @@
 azure-core
 azure-functions>=1.18.0
 pandas>=2.2.2,<3.0.0
-psycopg2-binary>=2.9.10  # Updated for Python 3.13 compatibility
+psycopg2-binary==2.9.9
 python-dotenv==1.0.1
 azure-storage-blob>=12.19.0
 psutil>=5.9.0  # For memory monitoring (optional)
-pyarrow>=14.0.0  # For fast parquet I/O (checkpointing)
-polars>=0.20.0  # High-performance DataFrame library (3-5x faster parsing, 50-70% less memory)
 

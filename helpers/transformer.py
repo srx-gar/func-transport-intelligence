@@ -1,7 +1,7 @@
 """Data transformation utilities for ZTDWR to transport_documents schema."""
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 import pandas as pd
@@ -208,8 +208,7 @@ def _combine_datetime_series(df: pd.DataFrame, date_col: str, time_col: Optional
     if date_col not in df.columns:
         return pd.Series([pd.NaT] * len(df), index=df.index)
 
-    def _combine(row):
-        """Combine date and time components. Returns pd.Timestamp or pd.NaT."""
+    def _combine(row) -> pd.Timestamp:
         date_str = _normalize_date_component(row.get(date_col))
         if date_str is None:
             return pd.NaT
@@ -339,7 +338,7 @@ def transform_to_transport_documents(
     transformed = transformed[TARGET_COLUMNS]
 
     # Add audit columns required by downstream upsert
-    timestamp_now = datetime.now(timezone.utc)
+    timestamp_now = datetime.utcnow()
     transformed['created_at'] = timestamp_now
     transformed['updated_at'] = timestamp_now
     transformed['sync_id'] = sync_id

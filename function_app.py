@@ -27,22 +27,6 @@ from helpers.validator import validate_ztdwr_data
 # Streaming optimization imports
 from helpers.streaming_parser import parse_ztdwr_chunks, estimate_chunk_size
 from helpers.chunked_processor import ChunkedPipelineProcessor, process_chunks_with_backpressure
-from helpers.checkpoint_manager import CheckpointManager, should_use_checkpointing
-
-# Polars high-performance parser imports
-try:
-    from helpers.polars_parser import parse_ztdwr_file_polars, polars_to_pandas
-    from helpers.polars_streaming import parse_ztdwr_chunks_polars, estimate_chunk_size_polars
-    POLARS_AVAILABLE = True
-    logging.info("🚀 Polars parser available - high-performance mode enabled")
-except ImportError:
-    # Define fallback functions when Polars is not available
-    parse_ztdwr_file_polars = None
-    polars_to_pandas = None
-    parse_ztdwr_chunks_polars = None
-    estimate_chunk_size_polars = None
-    POLARS_AVAILABLE = False
-    logging.info("ℹ️  Polars not available - using standard Pandas parser")
 
 # Configure logging BEFORE creating FunctionApp
 logging.basicConfig(
@@ -97,79 +81,6 @@ else:
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
     logging.getLogger('requests').setLevel(logging.WARNING)
-
-
-def _get_parser_info():
-    """Get information about which parser will be used."""
-    use_polars = os.getenv('USE_POLARS_PARSER', 'true').lower() == 'true'
-
-    if use_polars and POLARS_AVAILABLE:
-        return 'polars', '🚀 Polars (high-performance)'
-    elif POLARS_AVAILABLE:
-        return 'pandas', '🐼 Pandas (Polars disabled by config)'
-    else:
-        return 'pandas', '🐼 Pandas (Polars not installed)'
-
-
-def _parse_dat_file(content: bytes):
-    """
-    Parse DAT file using Polars (if available and enabled) or Pandas.
-
-    Environment variable: USE_POLARS_PARSER=true/false (default: true)
-
-    Returns Pandas DataFrame for backward compatibility with downstream code.
-    """
-    use_polars = os.getenv('USE_POLARS_PARSER', 'true').lower() == 'true'
-
-    if use_polars and POLARS_AVAILABLE:
-        logging.info("🚀 Using Polars parser (high-performance mode)")
-        df_polars = parse_ztdwr_file_polars(content)
-
-        # Log performance metrics
-        memory_mb = df_polars.estimated_size('mb')
-        logging.info(f"📊 Polars DataFrame: {len(df_polars):,} rows, {memory_mb:.2f} MB")
-
-        # Convert to Pandas for backward compatibility with transformer/validator
-        logging.debug("Converting Polars → Pandas for downstream compatibility")
-        return polars_to_pandas(df_polars)
-    else:
-        # Use standard Pandas parser
-        logging.info("🐼 Using Pandas parser (standard mode)")
-        return parse_ztdwr_file(content)
-
-
-def _parse_dat_chunks(content: bytes, chunk_size: int, decompress: bool = True):
-    """
-    Parse DAT file in chunks using Polars (if available) or Pandas.
-
-    Returns iterator of Pandas DataFrames for backward compatibility.
-    """
-    use_polars = os.getenv('USE_POLARS_PARSER', 'true').lower() == 'true'
-
-    if use_polars and POLARS_AVAILABLE:
-        logging.info("🚀 Using Polars streaming parser (memory-efficient mode)")
-
-        # Parse with Polars and convert chunks to Pandas
-        for chunk_polars in parse_ztdwr_chunks_polars(content, chunk_size=chunk_size, decompress=decompress):
-            # Convert to Pandas for downstream compatibility
-            yield polars_to_pandas(chunk_polars)
-    else:
-        # Use standard Pandas streaming parser
-        logging.info("🐼 Using Pandas streaming parser")
-        yield from parse_ztdwr_chunks(content, chunk_size=chunk_size, decompress=decompress)
-
-
-def _estimate_chunk_size(file_size_bytes: int, available_memory_mb: int = 512) -> int:
-    """
-    Estimate optimal chunk size using Polars (if available) or Pandas logic.
-    """
-    use_polars = os.getenv('USE_POLARS_PARSER', 'true').lower() == 'true'
-
-    if use_polars and POLARS_AVAILABLE:
-        return estimate_chunk_size_polars(file_size_bytes, available_memory_mb)
-    else:
-        return estimate_chunk_size(file_size_bytes, available_memory_mb)
-
 
 def _run_sync_pipeline(
         *,
@@ -247,9 +158,8 @@ def _run_sync_pipeline(
                 content = new_header + b"\n" + rest
                 logging.info("Sanitized header (preview): %s", new_header[:200])
             else:
-                # text str - convert to string first if needed
-                text_content = content if isinstance(content, str) else content.decode('utf-8')
-                parts = text_content.split('\n', 1)
+                # text str
+                parts = content.split('\n', 1)
                 header = parts[0]
                 rest = parts[1] if len(parts) > 1 else ''
                 header_tokens = header.split('|')
@@ -260,20 +170,18 @@ def _run_sync_pipeline(
                     s = s.lstrip('^').rstrip('~')
                     cleaned_tokens.append(s)
                 new_header = '|'.join(cleaned_tokens)
-                content = (new_header + '\n' + rest).encode('utf-8')
+                content = new_header + '\n' + rest
                 logging.info("Sanitized header (preview): %s", new_header[:200])
         except Exception:
             logging.exception('Failed to sanitize header; continuing with original content')
 
         # Step 2: Parse raw text into a DataFrame
-        parser_type, parser_desc = _get_parser_info()
-        logging.info("📄 Parsing file content (%s bytes) with %s...", len(content), parser_desc)
+        logging.info("📄 Parsing file content (%s bytes)...", len(content))
         parse_start = datetime.now(timezone.utc)
-        df = _parse_dat_file(content)
+        df = parse_ztdwr_file(content)
         total_rows = len(df)
         parse_duration = (datetime.now(timezone.utc) - parse_start).total_seconds()
-        logging.info("✅ Parsed %s rows from %s in %.2f seconds using %s",
-                     total_rows, file_name, parse_duration, parser_type)
+        logging.info("✅ Parsed %s rows from %s in %.2f seconds", total_rows, file_name, parse_duration)
 
         # Step 3: Validate source data
         logging.info("✔️  Validating %s rows...", total_rows)
@@ -518,14 +426,12 @@ def _run_streaming_pipeline(
         # Determine optimal chunk size based on file size
         file_size = blob_size or len(raw_content)
         available_memory_mb = int(os.getenv('MAX_MEMORY_MB', '512'))
-        chunk_size = _estimate_chunk_size(file_size, available_memory_mb)
+        chunk_size = estimate_chunk_size(file_size, available_memory_mb)
 
         # Estimate total chunks
         estimated_rows = file_size // 1000  # Rough estimate: 1KB per row
         estimated_chunks = max(1, estimated_rows // chunk_size)
 
-        parser_type, parser_desc = _get_parser_info()
-        logging.info(f"📊 Using {parser_desc}")
         logging.info(f"📊 Chunk size: {chunk_size} rows | Estimated {estimated_chunks} chunks")
 
         # Get error threshold from config
@@ -537,7 +443,7 @@ def _run_streaming_pipeline(
         logging.info("🔄 Creating chunk iterator and starting processing...")
 
         # Create chunk iterator - will decompress automatically if needed
-        chunk_iterator = _parse_dat_chunks(
+        chunk_iterator = parse_ztdwr_chunks(
             raw_content,
             chunk_size=chunk_size,
             decompress=True
@@ -650,289 +556,6 @@ def _run_streaming_pipeline(
         raise
 
 
-def _run_streaming_pipeline_with_checkpoints(
-        *,
-        file_name: str,
-        blob_path: str,
-        raw_content: bytes,
-        trigger: str,
-        blob_size: Optional[int] = None,
-) -> dict:
-    """
-    Execute streaming pipeline with parquet-based checkpointing.
-
-    Two-phase approach:
-    1. Convert .dat to parquet chunks (if not already done)
-    2. Process parquet chunks (resumable from any point)
-
-    Benefits:
-    - Fault-tolerant: Resume from last successful chunk on failure
-    - 60x faster resume: Read from parquet instead of re-parsing .dat
-    - Observable progress: Track completion per chunk
-    """
-
-    sync_id = f"sync_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-    start_time = datetime.now(timezone.utc)
-
-    logging.info("=" * 80)
-    logging.info("🚀 STARTING STREAMING PIPELINE WITH CHECKPOINTS")
-    logging.info("=" * 80)
-    logging.info(
-        "Sync ID: %s | File: %s | Size: %.2f MB | Trigger: %s",
-        sync_id,
-        file_name,
-        (blob_size or len(raw_content)) / 1024 / 1024,
-        trigger,
-    )
-
-    # Persist initial sync metadata
-    update_sync_metadata(
-        sync_id=sync_id,
-        file_name=file_name,
-        file_path=blob_path,
-        file_size_bytes=blob_size or len(raw_content),
-        status='IN_PROGRESS',
-    )
-
-    # Initialize checkpoint manager
-    checkpoint_base = os.getenv('CHECKPOINT_BASE_PATH', 'checkpoints')
-    checkpoint_manager = CheckpointManager(sync_id, file_name, checkpoint_base)
-
-    try:
-        # PHASE 1: Convert .dat to Parquet Chunks (if not already done)
-        # ==============================================================
-        if not checkpoint_manager.checkpoint_exists():
-            logging.info("📦 PHASE 1: Converting .dat file to parquet chunks...")
-
-            # Determine optimal chunk size
-            file_size = blob_size or len(raw_content)
-            available_memory_mb = int(os.getenv('MAX_MEMORY_MB', '512'))
-            chunk_size = _estimate_chunk_size(file_size, available_memory_mb)
-
-            # Create checkpoint structure
-            estimated_rows = file_size // 1000  # Rough estimate: 1KB per row
-            estimated_chunks = max(1, estimated_rows // chunk_size)
-
-            parser_type, parser_desc = _get_parser_info()
-            logging.info(f"📊 Using {parser_desc} for checkpoint conversion")
-
-            checkpoint_manager.create_checkpoint(
-                total_chunks=estimated_chunks,
-                chunk_size=chunk_size,
-                file_size_bytes=file_size,
-                source_path=blob_path
-            )
-
-            # Parse .dat file into chunks and save as parquet
-            chunk_iterator = _parse_dat_chunks(
-                raw_content,
-                chunk_size=chunk_size,
-                decompress=True
-            )
-
-            chunk_id = 0
-            for chunk_df in chunk_iterator:
-                # Save chunk as parquet (fast columnar format, compressed)
-                checkpoint_manager.save_chunk_parquet(chunk_id, chunk_df)
-                chunk_id += 1
-
-                logging.info(f"✅ Converted chunk {chunk_id} to parquet ({len(chunk_df)} rows)")
-
-            # Update manifest with actual chunk count
-            checkpoint_manager.manifest['total_chunks'] = chunk_id
-            checkpoint_manager.finalize_conversion()
-
-            logging.info(f"✅ PHASE 1 COMPLETE: Converted {chunk_id} chunks to parquet")
-
-        else:
-            logging.info("♻️  PHASE 1 SKIPPED: Parquet checkpoints already exist (resuming)")
-
-        # PHASE 2: Process Parquet Chunks (Resumable)
-        # ============================================
-        logging.info("⚙️  PHASE 2: Processing parquet chunks...")
-
-        # Get pending chunks (not yet completed)
-        pending_chunks = checkpoint_manager.get_pending_chunks()
-        total_chunks = checkpoint_manager.get_total_chunks()
-        completed_initial = total_chunks - len(pending_chunks)
-
-        if completed_initial > 0:
-            logging.info(
-                f"♻️  RESUMING from checkpoint: {completed_initial}/{total_chunks} chunks already completed, "
-                f"{len(pending_chunks)} remaining"
-            )
-        else:
-            logging.info(f"📊 Processing {total_chunks} chunks from start")
-
-        # Get error threshold from config
-        error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.05'))
-
-        # Create chunked processor
-        processor = ChunkedPipelineProcessor(sync_id, file_name, error_threshold)
-
-        # Process each pending chunk
-        for chunk_id in pending_chunks:
-            try:
-                chunk_num = chunk_id + 1
-                logging.info(f"📦 Processing chunk {chunk_num}/{total_chunks} (ID: {chunk_id})...")
-
-                # Load chunk from parquet (60x faster than parsing .dat)
-                chunk_df = checkpoint_manager.load_chunk(chunk_id)
-
-                # Process chunk: validate, transform, upsert
-                chunk_inserted, chunk_updated = processor.process_chunk(chunk_df)
-
-                # Mark chunk as completed in manifest
-                checkpoint_manager.mark_chunk_complete(
-                    chunk_id,
-                    records_inserted=chunk_inserted,
-                    records_updated=chunk_updated,
-                    validation_errors=0  # Validation errors already tracked in processor
-                )
-
-                logging.info(
-                    f"✅ Chunk {chunk_num}/{total_chunks} complete: "
-                    f"+{chunk_inserted} inserted, +{chunk_updated} updated"
-                )
-
-            except Exception as chunk_error:
-                logging.error(f"❌ Chunk {chunk_id} failed: {chunk_error}")
-
-                # Mark chunk as failed
-                checkpoint_manager.mark_chunk_failed(chunk_id, str(chunk_error))
-
-                # Decide whether to continue or abort
-                # Continue by default (retry failed chunks on next run)
-                # Only abort on truly fatal errors
-                if "missing primary key" in str(chunk_error).lower():
-                    logging.error("Fatal error detected, aborting sync")
-                    raise
-
-                logging.warning(f"Continuing to next chunk (chunk {chunk_id} will retry on next run)")
-
-        # Get processing summary
-        summary = processor.get_summary()
-        progress = checkpoint_manager.get_progress_summary()
-
-        # Refresh materialized views
-        if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
-            refresh_materialized_views()
-            logging.info("Materialized views refreshed")
-
-        # Determine final status
-        if progress['failed_chunks'] > 0:
-            status = 'PARTIAL_SUCCESS'
-            logging.warning(
-                f"Sync partially successful: {progress['failed_chunks']} chunks failed, "
-                f"will retry on next run"
-            )
-        elif summary['failed_rows'] > 0:
-            status = 'PARTIAL_SUCCESS'
-        else:
-            status = 'SUCCESS'
-
-        # Update sync metadata
-        update_sync_metadata(
-            sync_id=sync_id,
-            file_name=file_name,
-            status=status,
-            records_total=summary['total_rows'],
-            records_inserted=summary['records_inserted'],
-            records_updated=summary['records_updated'],
-            records_failed=summary['failed_rows'],
-            validation_errors=summary['validation_errors'] if summary['validation_errors'] else None,
-        )
-
-        # Send alerts if needed
-        if summary['validation_errors'] or progress['failed_chunks'] > 0:
-            send_alert_email(
-                sync_id,
-                file_name,
-                f"Sync completed with {summary['failed_rows']} validation errors and "
-                f"{progress['failed_chunks']} failed chunks",
-                summary['validation_errors'],
-                is_warning=True,
-            )
-
-        # Cleanup checkpoint files on complete success
-        cleanup_on_success = os.getenv('CHECKPOINT_CLEANUP_ON_SUCCESS', 'true').lower() == 'true'
-        if status == 'SUCCESS' and cleanup_on_success:
-            checkpoint_manager.cleanup()
-            logging.info("🗑️  Checkpoint files cleaned up after successful sync")
-        else:
-            logging.info(
-                f"♻️  Checkpoint files retained for retry "
-                f"(status={status}, cleanup_on_success={cleanup_on_success})"
-            )
-
-        # Calculate performance metrics
-        end_time = datetime.now(timezone.utc)
-        duration_seconds = (end_time - start_time).total_seconds()
-        duration_minutes = duration_seconds / 60
-        total_rows = summary['total_rows']
-        rows_per_minute = total_rows / duration_minutes if duration_minutes > 0 else 0
-        rows_per_second = total_rows / duration_seconds if duration_seconds > 0 else 0
-
-        logging.info(
-            "Checkpointed streaming sync %s completed (%s): "
-            "inserted=%s updated=%s errors=%s | "
-            "Performance: %s rows in %.2f min (%.0f rows/min, %.1f rows/sec) | "
-            "Chunks: %s total, %s completed, %s failed",
-            sync_id,
-            status,
-            summary['records_inserted'],
-            summary['records_updated'],
-            summary['failed_rows'],
-            total_rows,
-            duration_minutes,
-            rows_per_minute,
-            rows_per_second,
-            progress['total_chunks'],
-            progress['completed_chunks'],
-            progress['failed_chunks'],
-        )
-
-        result = {
-            'sync_id': sync_id,
-            'status': status,
-            'trigger': trigger,
-            'file_name': file_name,
-            'file_path': blob_path,
-            'records_total': total_rows,
-            'records_inserted': summary['records_inserted'],
-            'records_updated': summary['records_updated'],
-            'records_failed': summary['failed_rows'],
-            'duration_seconds': round(duration_seconds, 2),
-            'duration_minutes': round(duration_minutes, 2),
-            'rows_per_minute': round(rows_per_minute, 2),
-            'rows_per_second': round(rows_per_second, 2),
-            'processing_mode': 'streaming_with_checkpoints',
-            'checkpoint_stats': {
-                'total_chunks': progress['total_chunks'],
-                'completed_chunks': progress['completed_chunks'],
-                'failed_chunks': progress['failed_chunks'],
-                'resumed_from_checkpoint': completed_initial > 0,
-                'chunks_skipped': completed_initial,
-            }
-        }
-
-        # Print summary
-        print('SYNC_SUMMARY ' + json.dumps(result, default=str))
-
-        return result
-
-    except Exception as exc:
-        logging.error("Checkpointed streaming sync %s failed: %s", sync_id, exc, exc_info=True)
-        update_sync_metadata(
-            sync_id=sync_id,
-            file_name=file_name,
-            status='FAILED',
-            error_message=str(exc),
-        )
-        send_alert_email(sync_id, file_name, str(exc))
-        raise
-
-
 @app.blob_trigger(
     arg_name="myblob",
     path="data/hex-ztdwr/{name}",
@@ -950,35 +573,11 @@ def ztdwr_sync(myblob: func.InputStream):
     sys.stdout.flush()
     sys.stderr.flush()
 
-    # Defensive check: Ensure myblob is not None
-    if myblob is None:
-        error_msg = "Blob parameter is None - blob may have been deleted or binding failed"
-        logging.error(error_msg)
-        sys.stdout.flush()
-        raise ValueError(error_msg)
-
-    # Defensive check: Ensure blob has required attributes
-    try:
-        blob_name = myblob.name
-        blob_length = myblob.length
-    except AttributeError as e:
-        error_msg = f"Blob object missing required attributes: {e}"
-        logging.error(error_msg)
-        sys.stdout.flush()
-        raise ValueError(error_msg)
-
-    # Validate blob name exists
-    if not blob_name:
-        error_msg = "Blob name is empty or null"
-        logging.error(error_msg)
-        sys.stdout.flush()
-        raise ValueError(error_msg)
-
-    file_name = blob_name.split('/')[-1]
-    file_size_mb = (blob_length or 0) / 1024 / 1024
+    file_name = myblob.name.split('/')[-1]
+    file_size_mb = (myblob.length or 0) / 1024 / 1024
 
     logging.info("📋 Blob: %s | Size: %s bytes (%.2f MB)",
-                 file_name, blob_length, file_size_mb)
+                 file_name, myblob.length, file_size_mb)
     sys.stdout.flush()
 
     # Download blob content with progress logging for large files
@@ -986,19 +585,18 @@ def ztdwr_sync(myblob: func.InputStream):
     sys.stdout.flush()
 
     download_start = datetime.now(timezone.utc)
-    raw_content = None
 
-    try:
-        # For large files, read in chunks with progress logging
-        if file_size_mb > 10:
-            logging.info("⚠️  Large file detected - using chunked download with progress tracking")
-            sys.stdout.flush()
+    # For large files, read in chunks with progress logging
+    if file_size_mb > 10:
+        logging.info("⚠️  Large file detected - using chunked download with progress tracking")
+        sys.stdout.flush()
 
-            chunks = []
-            bytes_downloaded = 0
-            chunk_size = 10 * 1024 * 1024  # 10MB chunks
-            last_log_time = datetime.now(timezone.utc)
+        chunks = []
+        bytes_downloaded = 0
+        chunk_size = 10 * 1024 * 1024  # 10MB chunks
+        last_log_time = datetime.now(timezone.utc)
 
+        try:
             while True:
                 chunk = myblob.read(chunk_size)
                 if not chunk:
@@ -1009,36 +607,27 @@ def ztdwr_sync(myblob: func.InputStream):
                 # Log progress every 10 seconds or 50MB to show function is alive
                 current_time = datetime.now(timezone.utc)
                 if (current_time - last_log_time).total_seconds() > 10 or bytes_downloaded % (50 * 1024 * 1024) < chunk_size:
-                    pct = (bytes_downloaded / blob_length * 100) if blob_length else 0
+                    pct = (bytes_downloaded / myblob.length * 100) if myblob.length else 0
                     elapsed = (current_time - download_start).total_seconds()
                     speed_mbps = (bytes_downloaded / 1024 / 1024) / elapsed if elapsed > 0 else 0
                     logging.info("⏳ Download progress: %.1f%% (%d/%d MB) at %.2f MB/s",
                                 pct, bytes_downloaded // (1024*1024),
-                                (blob_length or 0) // (1024*1024), speed_mbps)
+                                (myblob.length or 0) // (1024*1024), speed_mbps)
                     sys.stdout.flush()
                     last_log_time = current_time
 
             raw_content = b''.join(chunks)
             logging.info("✅ Chunked download complete: %d bytes", len(raw_content))
             sys.stdout.flush()
-        else:
-            # Small files - direct read
-            raw_content = myblob.read()
-            logging.info("✅ Direct download complete: %d bytes", len(raw_content))
+        except Exception as e:
+            logging.error("❌ Download failed: %s", e)
             sys.stdout.flush()
-
-    except Exception as e:
-        error_msg = f"Failed to download blob content: {e}"
-        logging.error("❌ %s", error_msg, exc_info=True)
+            raise
+    else:
+        # Small files - direct read
+        raw_content = myblob.read()
+        logging.info("✅ Direct download complete: %d bytes", len(raw_content))
         sys.stdout.flush()
-        raise RuntimeError(error_msg) from e
-
-    # Validate we got content
-    if raw_content is None or len(raw_content) == 0:
-        error_msg = f"Blob download returned empty content (blob_name={file_name}, expected_size={blob_length})"
-        logging.error(error_msg)
-        sys.stdout.flush()
-        raise ValueError(error_msg)
 
     download_duration = (datetime.now(timezone.utc) - download_start).total_seconds()
     download_speed = (len(raw_content) / 1024 / 1024) / download_duration if download_duration > 0 else 0
@@ -1050,41 +639,19 @@ def ztdwr_sync(myblob: func.InputStream):
     file_size = myblob.length or len(raw_content)
     file_size_mb = file_size / 1024 / 1024
 
-    # Get thresholds from config
-    streaming_threshold_mb = int(os.getenv('STREAMING_THRESHOLD_MB', '20'))
-    checkpoint_threshold_mb = int(os.getenv('CHECKPOINT_THRESHOLD_MB', '50'))
+    # Get threshold from config (default 20MB - conservative for production)
+    threshold_mb = int(os.getenv('STREAMING_THRESHOLD_MB', '20'))
     use_streaming = os.getenv('ENABLE_STREAMING', 'true').lower() == 'true'
-    use_checkpointing = os.getenv('ENABLE_CHECKPOINTING', 'true').lower() == 'true'
 
     logging.info(
-        "📊 PIPELINE SELECTION: file_size=%.2f MB, streaming_threshold=%d MB, "
-        "checkpoint_threshold=%d MB, streaming_enabled=%s, checkpointing_enabled=%s",
-        file_size_mb, streaming_threshold_mb, checkpoint_threshold_mb,
-        use_streaming, use_checkpointing
+        "📊 PIPELINE SELECTION: file_size=%.2f MB, threshold=%d MB, streaming_enabled=%s",
+        file_size_mb, threshold_mb, use_streaming
     )
 
-    # Pipeline selection logic:
-    # 1. Very large files (>50MB) → Streaming with checkpoints (most robust)
-    # 2. Large files (>20MB) → Streaming without checkpoints
-    # 3. Small files (<=20MB) → Standard pipeline
-
-    if use_checkpointing and use_streaming and file_size_mb > checkpoint_threshold_mb:
-        logging.info(
-            "🔄 Selected: STREAMING PIPELINE WITH CHECKPOINTS "
-            "(file size %.2f MB > %d MB checkpoint threshold)",
-            file_size_mb, checkpoint_threshold_mb
-        )
-        _run_streaming_pipeline_with_checkpoints(
-            file_name=file_name,
-            blob_path=myblob.name,
-            raw_content=raw_content,
-            trigger='blob',
-            blob_size=myblob.length,
-        )
-    elif use_streaming and file_size_mb > streaming_threshold_mb:
+    if use_streaming and file_size_mb > threshold_mb:
         logging.info(
             "🌊 Selected: STREAMING PIPELINE (file size %.2f MB > %d MB threshold)",
-            file_size_mb, streaming_threshold_mb
+            file_size_mb, threshold_mb
         )
         _run_streaming_pipeline(
             file_name=file_name,
@@ -1101,7 +668,7 @@ def ztdwr_sync(myblob: func.InputStream):
         else:
             logging.info(
                 "📄 Selected: STANDARD PIPELINE (file size %.2f MB <= %d MB threshold)",
-                file_size_mb, streaming_threshold_mb
+                file_size_mb, threshold_mb
             )
         _run_sync_pipeline(
             file_name=file_name,
@@ -1199,29 +766,13 @@ def manual_sync(req: func.HttpRequest) -> func.HttpResponse:
         file_size = blob_size or len(raw_content)
         file_size_mb = file_size / 1024 / 1024
 
-        # Get thresholds from config
-        streaming_threshold_mb = int(os.getenv('STREAMING_THRESHOLD_MB', '20'))
-        checkpoint_threshold_mb = int(os.getenv('CHECKPOINT_THRESHOLD_MB', '50'))
+        # Get threshold from config (default 20MB - conservative for production)
+        threshold_mb = int(os.getenv('STREAMING_THRESHOLD_MB', '20'))
         use_streaming = os.getenv('ENABLE_STREAMING', 'true').lower() == 'true'
-        use_checkpointing = os.getenv('ENABLE_CHECKPOINTING', 'true').lower() == 'true'
 
-        # Pipeline selection (same logic as blob trigger)
-        if use_checkpointing and use_streaming and file_size_mb > checkpoint_threshold_mb:
+        if use_streaming and file_size_mb > threshold_mb:
             logging.info(
-                f"Manual sync: File size {file_size_mb:.2f} MB > {checkpoint_threshold_mb} MB, "
-                f"using STREAMING pipeline WITH CHECKPOINTS"
-            )
-            result = _run_streaming_pipeline_with_checkpoints(
-                file_name=file_name,
-                blob_path=f"{container}/{blob_path}",
-                raw_content=raw_content,
-                trigger='http',
-                blob_size=blob_size,
-            )
-        elif use_streaming and file_size_mb > streaming_threshold_mb:
-            logging.info(
-                f"Manual sync: File size {file_size_mb:.2f} MB > {streaming_threshold_mb} MB threshold, "
-                f"using STREAMING pipeline"
+                f"Manual sync: File size {file_size_mb:.2f} MB > {threshold_mb} MB threshold, using STREAMING pipeline"
             )
             result = _run_streaming_pipeline(
                 file_name=file_name,
@@ -1232,8 +783,7 @@ def manual_sync(req: func.HttpRequest) -> func.HttpResponse:
             )
         else:
             logging.info(
-                f"Manual sync: File size {file_size_mb:.2f} MB <= {streaming_threshold_mb} MB threshold, "
-                f"using STANDARD pipeline"
+                f"Manual sync: File size {file_size_mb:.2f} MB <= {threshold_mb} MB threshold, using STANDARD pipeline"
             )
             result = _run_sync_pipeline(
                 file_name=file_name,

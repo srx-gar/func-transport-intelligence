@@ -8,57 +8,7 @@ import gzip
 import pandas as pd
 import logging
 import re
-from typing import Iterator, Tuple, Literal
-
-
-# Optimized dtype mapping to reduce memory usage by 50%
-# Use 'string' for text fields and 'float32' instead of 'float64' for numeric fields
-OPTIMIZED_DTYPES = {
-    # Primary identifiers (string)
-    'surat_pengantar_brg': 'string',
-    'no_tiket': 'string',
-    'no_kontrak': 'string',
-    'equipment': 'string',
-    'no_polisi': 'string',
-    'reservation': 'string',
-
-    # Person identifiers (string)
-    'nik_supir': 'string',
-    'nik_pemuat_1': 'string',
-    'nik_pemuat_2': 'string',
-    'nik_pemuat_3': 'string',
-    'nik_pemuat_4': 'string',
-    'nik_pemuat_5': 'string',
-    'nik_supir_mandah': 'string',
-    'nama_supir': 'string',
-
-    # Organization/location (string)
-    'transporter': 'string',
-    'transporter_name': 'string',
-    'sender': 'string',
-    'sender_name': 'string',
-    'receiver': 'string',
-    'receiver_name': 'string',
-    'nama_pt': 'string',
-    'pengangkut': 'string',
-    'asal': 'string',
-    'tujuan': 'string',
-    'divisi_sender': 'string',
-    'division_receiver': 'string',
-
-    # Numeric fields - use float32 instead of float64 to save 50% memory
-    'kilometer_actual': 'float32',
-    'kilometer_std': 'float32',
-    'bbm_actual': 'float32',
-    'bbm_std': 'float32',
-    'qty_dikirim': 'float32',
-    'qty_diterima': 'float32',
-    'kapasitas_kendaraan': 'float32',
-    'ongkos_angkut': 'float32',
-    'hk': 'float32',
-    'jaring_tbs': 'float32',
-    'susut_timbang': 'float32',
-}
+from typing import Iterator, Optional, Tuple
 
 
 def _canonicalize_column_name(col: str) -> str:
@@ -73,7 +23,7 @@ def _canonicalize_column_name(col: str) -> str:
     return col.strip("_").lower()
 
 
-def _detect_delimiter(first_line: str) -> Tuple[str, Literal["c", "python"]]:
+def _detect_delimiter(first_line: str) -> Tuple[str, str]:
     """Detect the delimiter and pandas engine to use."""
     normalized_first_line = first_line.replace('\\', '')
 
@@ -81,8 +31,8 @@ def _detect_delimiter(first_line: str) -> Tuple[str, Literal["c", "python"]]:
         return '\t', 'c'
     elif '~^' in normalized_first_line:
         return r'~\\^', 'python'
-    elif '|' in first_line:
-        return '|', 'c'
+    elif '' in first_line:
+        return '', 'c'
     else:
         return '\t', 'c'
 
@@ -189,25 +139,15 @@ def parse_ztdwr_chunks(
 
     mapped_headers = [canonical_map.get(col, col) for col in canonical_headers]
 
-    # Build dtype mapping for memory optimization
-    # Use optimized dtypes where available, fallback to 'string' for unmapped columns
-    dtype_mapping = {}
-    for header in mapped_headers:
-        if header in OPTIMIZED_DTYPES:
-            dtype_mapping[header] = OPTIMIZED_DTYPES[header]
-        # Default: treat unknown columns as strings to be safe
-        # This prevents pandas from inferring types which can be slow and memory-intensive
-
     # Read file in chunks
     text_io = io.StringIO(text)
     chunk_iter = pd.read_csv(
         text_io,
         sep=delimiter,
         engine=engine,
-        dtype=dtype_mapping if dtype_mapping else str,  # Use optimized dtypes
+        dtype=str,
         na_values=['', 'NULL', 'null', 'None', '~'],
         keep_default_na=False,
-        low_memory=False,  # More consistent dtype inference
         chunksize=chunk_size
     )
 

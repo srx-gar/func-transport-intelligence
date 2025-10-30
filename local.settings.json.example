@@ -9,20 +9,9 @@
     "DB_USER": "ti_user",
     "DB_PASSWORD": "<PASSWORD>",
     "DB_NAME": "transport_intelligence",
-    "USE_POLARS_PARSER": "true",
     "VALIDATION_ERROR_THRESHOLD": "0.10",
     "ENABLE_MV_REFRESH": "true",
     "ALERT_EMAIL": "ops-team@company.com",
-    "MANUAL_SYNC_CONTAINER": "data",
-    "ENABLE_STREAMING": "true",
-    "STREAMING_THRESHOLD_MB": "20",
-    "ENABLE_CHECKPOINTING": "true",
-    "CHECKPOINT_THRESHOLD_MB": "50",
-    "CHECKPOINT_BASE_PATH": "checkpoints",
-    "CHECKPOINT_CLEANUP_ON_SUCCESS": "true",
-    "MAX_MEMORY_MB": "512",
-    "MAX_BUFFER_CHUNKS": "2",
-    "AZURE_LOG_LEVEL": "WARNING",
-    "DEV_LOG_LEVEL": ""
+    "MANUAL_SYNC_CONTAINER": "data"
   }
 }

@@ -12,7 +12,6 @@ This Azure Function automatically processes daily SAP ZTDWR (Surat Perintah Jala
 
 - ✅ **Automatic Trigger**: Event Grid detects new `.dat` files in `hex-ztdwr/` container
 - ✅ **Gzip Support**: Auto-detects and decompresses gzipped files
-- ✅ **High-Performance Parsing**: Polars-based parser (3-5x faster, 50-70% less memory) 🚀
 - ✅ **Data Validation**: Business rule validation with configurable error threshold
 - ✅ **Idempotent Upsert**: Uses `ON CONFLICT` to handle retries safely
 - ✅ **Partial Error Handling**: Processes valid rows, logs invalid ones
@@ -357,46 +356,6 @@ The table migration defines `surat_pengantar_barang` as the primary key. No addi
 
 ---
 
-## 🚀 High-Performance Parsing with Polars
-
-This project now supports **Polars** for DAT file parsing, offering significant performance improvements:
-
-### Performance Benefits
-
-| Metric | Pandas (Old) | Polars (New) | Improvement |
-|--------|--------------|--------------|-------------|
-| **Parse Speed** | Baseline | 3-5x faster | Multi-threaded CSV parsing |
-| **Memory Usage** | Baseline | 50-70% less | Arrow columnar format |
-| **100MB File** | ~38s, 350MB RAM | ~9s, 120MB RAM | **4.2x faster, 66% less memory** |
-
-### Quick Start
-
-Polars is already installed (see `requirements.txt`). The parser automatically uses Polars when available:
-
-```python
-from helpers.polars_parser import parse_ztdwr_file_polars
-
-# Parse with Polars (3-5x faster)
-df = parse_ztdwr_file_polars(content)
-print(f"Memory: {df.estimated_size('mb'):.2f} MB")
-```
-
-### Benchmark Your Files
-
-```bash
-# Compare Polars vs Pandas on your data
-python scripts/benchmark_polars_vs_pandas.py --file path/to/your_file.dat --runs 5
-```
-
-### Documentation
-
-- **Quick Reference**: [`POLARS_QUICKREF.md`](POLARS_QUICKREF.md)
-- **User Guide**: [`docs/POLARS_GUIDE.md`](docs/POLARS_GUIDE.md)
-- **Full Proposal**: [`docs/04-polars-migration-proposal.md`](docs/04-polars-migration-proposal.md)
-- **Summary**: [`POLARS_SUMMARY.md`](POLARS_SUMMARY.md)
-
----
-
 ## Monitoring
 
 ### Health Check
@@ -583,7 +542,6 @@ az webapp log config --name "$FUNCTION_APP" --resource-group "$RG" --application
 | `DB_NAME` | Database name | (required) |
 | `DB_SCHEMA` | DB schema for target table | `public` |
 | `DB_TABLE` | Target table name | `transport_documents` |
-| `USE_POLARS_PARSER` | Enable Polars high-perf parser | `true` |
 | `VALIDATION_ERROR_THRESHOLD` | Max error rate (0-1) | `0.10` (10%) |
 | `ENABLE_MV_REFRESH` | Refresh MVs after sync | `true` |
 | `ALERT_EMAIL` | Email for failure alerts | `ops-team@company.com` |
