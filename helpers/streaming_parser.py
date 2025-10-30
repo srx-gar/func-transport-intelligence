@@ -246,8 +246,8 @@ def estimate_chunk_size(file_size_bytes: int, available_memory_mb: int = 512) ->
     # Calculate chunk size
     chunk_size = max_chunk_bytes // bytes_per_row
 
-    # Reduce max to 30K rows to avoid statement timeout (consistent with polars)
-    chunk_size = max(1000, min(30000, chunk_size))
+    # Reduce max to 20K rows to avoid Azure Functions timeout (consistent with polars)
+    chunk_size = max(1000, min(20000, chunk_size))
 
     # If file is small, use smaller chunks
     estimated_total_rows = file_size_bytes // bytes_per_row
