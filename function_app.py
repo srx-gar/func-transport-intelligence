@@ -778,16 +778,39 @@ def _run_streaming_pipeline_with_checkpoints(
         # Process all pending chunks
         # With 20K rows/chunk taking ~60-90 seconds each, we should be able to process
         # 5-6 chunks within the 10-minute Azure Functions timeout
+        logging.info(f"🔄 Starting chunk processing loop: {len(pending_chunks)} chunks to process")
+        sys.stdout.flush()
+
+        chunks_processed = 0
         for chunk_id in pending_chunks:
             try:
                 chunk_num = chunk_id + 1
                 logging.info(f"📦 Processing chunk {chunk_num}/{total_chunks} (ID: {chunk_id})...")
+                sys.stdout.flush()
 
                 # Load chunk from parquet (60x faster than parsing .dat)
+                logging.info(f"Loading chunk {chunk_num} from parquet...")
+                sys.stdout.flush()
                 chunk_df = checkpoint_manager.load_chunk(chunk_id)
+                logging.info(f"Loaded chunk {chunk_num}: {len(chunk_df)} rows")
+                sys.stdout.flush()
 
                 # Process chunk: validate, transform, upsert
-                chunk_inserted, chunk_updated = processor.process_chunk(chunk_df)
+                logging.info(f"Calling processor.process_chunk() for chunk {chunk_num}...")
+                sys.stdout.flush()
+
+                try:
+                    chunk_inserted, chunk_updated = processor.process_chunk(chunk_df)
+                    logging.info(f"✅ processor.process_chunk() returned: +{chunk_inserted} inserted, +{chunk_updated} updated")
+                    sys.stdout.flush()
+                except Exception as process_error:
+                    logging.error(
+                        f"❌ FATAL: processor.process_chunk() failed for chunk {chunk_num}: {process_error}",
+                        exc_info=True
+                    )
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                    raise  # Re-raise to outer handler
 
                 # Mark chunk as completed in manifest
                 checkpoint_manager.mark_chunk_complete(
@@ -797,14 +820,24 @@ def _run_streaming_pipeline_with_checkpoints(
                     validation_errors=0  # Validation errors already tracked in processor
                 )
 
+                chunks_processed += 1
                 logging.info(
                     f"✅ Chunk {chunk_num}/{total_chunks} complete: "
-                    f"+{chunk_inserted} inserted, +{chunk_updated} updated"
+                    f"+{chunk_inserted} inserted, +{chunk_updated} updated "
+                    f"[{chunks_processed}/{len(pending_chunks)} chunks processed so far]"
                 )
+                sys.stdout.flush()
 
             except Exception as chunk_error:
                 logging.error(f"❌ Chunk {chunk_id} failed: {chunk_error}", exc_info=True)
+                sys.stdout.flush()
+                sys.stderr.flush()
                 checkpoint_manager.mark_chunk_failed(chunk_id, str(chunk_error))
+                # Don't continue - stop processing if a chunk fails
+                raise
+
+        logging.info(f"🏁 Chunk processing loop completed: {chunks_processed}/{len(pending_chunks)} chunks processed")
+        sys.stdout.flush()
 
 
         # Get processing summary
