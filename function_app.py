@@ -757,6 +757,10 @@ def _run_streaming_pipeline_with_checkpoints(
         total_chunks = checkpoint_manager.get_total_chunks()
         completed_initial = total_chunks - len(pending_chunks)
 
+        logging.info(f"📊 Chunk status: {completed_initial} completed, {len(pending_chunks)} pending out of {total_chunks} total")
+        logging.info(f"📋 Pending chunk IDs: {pending_chunks}")
+        sys.stdout.flush()
+
         if completed_initial > 0:
             logging.info(
                 f"♻️  RESUMING from checkpoint: {completed_initial}/{total_chunks} chunks already completed, "
@@ -771,21 +775,10 @@ def _run_streaming_pipeline_with_checkpoints(
         # Create chunked processor
         processor = ChunkedPipelineProcessor(sync_id, file_name, error_threshold)
 
-        # Limit chunks per run to avoid Azure Functions 10-minute timeout
-        # With 20K rows/chunk taking ~90 seconds, we can safely process 3-4 chunks
-        # in under 10 minutes, then exit and let checkpoint resume handle the rest
-        max_chunks_per_run = int(os.getenv('MAX_CHUNKS_PER_RUN', '3'))
-        chunks_to_process = pending_chunks[:max_chunks_per_run]
-
-        if len(pending_chunks) > max_chunks_per_run:
-            logging.warning(
-                f"⚠️  Limiting processing to {max_chunks_per_run} chunks per run "
-                f"(out of {len(pending_chunks)} pending) to avoid timeout. "
-                f"Remaining chunks will be processed on next run."
-            )
-
-        # Process limited set of chunks
-        for chunk_id in chunks_to_process:
+        # Process all pending chunks
+        # With 20K rows/chunk taking ~60-90 seconds each, we should be able to process
+        # 5-6 chunks within the 10-minute Azure Functions timeout
+        for chunk_id in pending_chunks:
             try:
                 chunk_num = chunk_id + 1
                 logging.info(f"📦 Processing chunk {chunk_num}/{total_chunks} (ID: {chunk_id})...")
@@ -837,14 +830,7 @@ def _run_streaming_pipeline_with_checkpoints(
             logging.info("Materialized views refreshed")
 
         # Determine final status
-        # If there are still pending chunks, keep status as IN_PROGRESS so it can resume
-        if progress['pending_chunks'] > 0:
-            status = 'IN_PROGRESS'
-            logging.info(
-                f"✅ Processed {progress['completed_chunks']}/{progress['total_chunks']} chunks successfully. "
-                f"{progress['pending_chunks']} chunks remaining for next run."
-            )
-        elif progress['failed_chunks'] > 0:
+        if progress['failed_chunks'] > 0:
             status = 'PARTIAL_SUCCESS'
             logging.warning(
                 f"Sync partially successful: {progress['failed_chunks']} chunks failed, "
@@ -885,16 +871,6 @@ def _run_streaming_pipeline_with_checkpoints(
         if status == 'SUCCESS' and cleanup_on_success:
             checkpoint_manager.cleanup()
             logging.info("🗑️  Checkpoint files cleaned up after successful sync")
-        elif status == 'IN_PROGRESS':
-            logging.info(
-                f"♻️  Checkpoint files retained - {progress['pending_chunks']} chunks pending. "
-                f"Function will need to be re-triggered to continue processing."
-            )
-            # TODO: Implement automatic retry mechanism (Queue message, Durable Functions, or Timer trigger)
-            logging.warning(
-                "⚠️  IMPORTANT: This sync is incomplete. Please re-trigger the function or "
-                "implement an automatic retry mechanism to process remaining chunks."
-            )
         else:
             logging.info(
                 f"♻️  Checkpoint files retained for retry "
@@ -1312,141 +1288,4 @@ def manual_sync(req: func.HttpRequest) -> func.HttpResponse:
             mimetype='application/json',
         )
 
-
-@app.timer_trigger(schedule="0 */5 * * * *", arg_name="timer", run_on_startup=False,
-                   use_monitor=False)
-def resume_checkpoints(timer: func.TimerRequest) -> None:
-    """
-    Timer-triggered function to resume incomplete checkpoint processing.
-    Runs every 5 minutes to check for pending checkpoints and continue processing.
-
-    This handles the case where blob trigger processed only part of a large file
-    due to the 10-minute Azure Functions timeout.
-    """
-    import glob
-
-    logging.info("⏰ Resume checkpoints timer triggered")
-
-    # Get checkpoint base path
-    checkpoint_base = os.getenv('CHECKPOINT_BASE_PATH', '/tmp/checkpoints')
-
-    if not os.path.exists(checkpoint_base):
-        logging.info("No checkpoint directory found, skipping resume")
-        return
-
-    # Find all checkpoint manifests
-    manifest_pattern = os.path.join(checkpoint_base, '*', 'manifest.json')
-    manifests = glob.glob(manifest_pattern)
-
-    if not manifests:
-        logging.info("No checkpoint manifests found, skipping resume")
-        return
-
-    logging.info(f"Found {len(manifests)} checkpoint manifest(s), checking for incomplete syncs...")
-
-    from helpers.checkpoint_manager import CheckpointManager
-
-    resumed_count = 0
-    for manifest_path in manifests:
-        try:
-            # Load manifest to check status
-            import json
-            with open(manifest_path, 'r') as f:
-                manifest = json.load(f)
-
-            sync_id = manifest.get('sync_id')
-            file_name = manifest.get('file_name')
-            status = manifest.get('status')
-            phase = manifest.get('phase')
-
-            # Only resume if conversion is complete but processing is not
-            if phase != 'PROCESSING' or status == 'COMPLETED':
-                logging.debug(f"Skipping {sync_id}: phase={phase}, status={status}")
-                continue
-
-            # Check for pending chunks
-            chunks = manifest.get('chunks', [])
-            pending = [c for c in chunks if c.get('status') in ['ready', 'pending']]
-
-            if not pending:
-                logging.debug(f"Skipping {sync_id}: no pending chunks")
-                continue
-
-            logging.info(
-                f"📦 Resuming incomplete sync: {sync_id} "
-                f"({len(pending)} pending chunks out of {len(chunks)})"
-            )
-
-            # Initialize checkpoint manager
-            checkpoint_manager = CheckpointManager(sync_id, file_name, checkpoint_base)
-
-            # Get pending chunks
-            pending_chunk_ids = checkpoint_manager.get_pending_chunks()
-
-            # Limit to max chunks per run
-            max_chunks_per_run = int(os.getenv('MAX_CHUNKS_PER_RUN', '3'))
-            chunks_to_process = pending_chunk_ids[:max_chunks_per_run]
-
-            logging.info(f"Processing {len(chunks_to_process)} chunks in this run")
-
-            # Create processor
-            from helpers.chunked_processor import ChunkedPipelineProcessor
-            error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.05'))
-            processor = ChunkedPipelineProcessor(sync_id, file_name, error_threshold)
-
-            # Process chunks
-            for chunk_id in chunks_to_process:
-                try:
-                    chunk_num = chunk_id + 1
-                    total_chunks = len(chunks)
-                    logging.info(f"📦 Processing chunk {chunk_num}/{total_chunks} (ID: {chunk_id})...")
-
-                    # Load and process chunk
-                    chunk_df = checkpoint_manager.load_chunk(chunk_id)
-                    chunk_inserted, chunk_updated = processor.process_chunk(chunk_df)
-
-                    # Mark complete
-                    checkpoint_manager.mark_chunk_complete(
-                        chunk_id,
-                        records_inserted=chunk_inserted,
-                        records_updated=chunk_updated,
-                        validation_errors=0
-                    )
-
-                    logging.info(f"✅ Chunk {chunk_num}/{total_chunks} complete: +{chunk_inserted} inserted, +{chunk_updated} updated")
-
-                except Exception as chunk_error:
-                    logging.error(f"❌ Chunk {chunk_id} failed: {chunk_error}", exc_info=True)
-                    checkpoint_manager.mark_chunk_failed(chunk_id, str(chunk_error))
-
-            # Check if all chunks complete
-            progress = checkpoint_manager.get_progress_summary()
-            if progress['pending_chunks'] == 0 and progress['failed_chunks'] == 0:
-                logging.info(f"✅ Sync {sync_id} fully completed! Cleaning up checkpoint files.")
-                checkpoint_manager.cleanup()
-
-                # Update sync metadata to SUCCESS (function already imported at top)
-                update_sync_metadata(
-                    sync_id=sync_id,
-                    file_name=file_name,
-                    status='SUCCESS',
-                    records_inserted=progress['total_records_inserted'],
-                    records_updated=progress['total_records_updated']
-                )
-            else:
-                logging.info(
-                    f"♻️  Sync {sync_id} partially complete: "
-                    f"{progress['completed_chunks']}/{progress['total_chunks']} chunks done, "
-                    f"{progress['pending_chunks']} pending, {progress['failed_chunks']} failed"
-                )
-
-            resumed_count += 1
-
-        except Exception as e:
-            logging.error(f"Error processing checkpoint {manifest_path}: {e}", exc_info=True)
-
-    if resumed_count > 0:
-        logging.info(f"✅ Resumed {resumed_count} incomplete sync(s)")
-    else:
-        logging.info("No incomplete syncs found to resume")
 
