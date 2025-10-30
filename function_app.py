@@ -27,7 +27,7 @@ from helpers.validator import validate_ztdwr_data
 # Streaming optimization imports
 from helpers.streaming_parser import parse_ztdwr_chunks, estimate_chunk_size
 from helpers.chunked_processor import ChunkedPipelineProcessor, process_chunks_with_backpressure
-from helpers.checkpoint_manager import CheckpointManager, should_use_checkpointing
+from helpers.checkpoint_manager import CheckpointManager
 
 # Polars high-performance parser imports
 try:
@@ -813,28 +813,6 @@ def _run_streaming_pipeline_with_checkpoints(
                 logging.error(f"❌ Chunk {chunk_id} failed: {chunk_error}", exc_info=True)
                 checkpoint_manager.mark_chunk_failed(chunk_id, str(chunk_error))
 
-            # Check if all chunks complete
-            progress = checkpoint_manager.get_progress_summary()
-            if progress['pending_chunks'] == 0 and progress['failed_chunks'] == 0:
-                logging.info(f"✅ Sync {sync_id} fully completed! Cleaning up checkpoint files.")
-                checkpoint_manager.cleanup()
-
-                # Update sync metadata to SUCCESS
-                from helpers.postgres_client import update_sync_metadata
-                update_sync_metadata(
-                    sync_id=sync_id,
-                    file_name=file_name,
-                    status='SUCCESS',
-                    records_inserted=progress['total_records_inserted'],
-                    records_updated=progress['total_records_updated']
-                )
-            else:
-                logging.info(
-                    f"♻️  Sync {sync_id} partially complete: "
-                    f"{progress['completed_chunks']}/{progress['total_chunks']} chunks done, "
-                    f"{progress['pending_chunks']} pending, {progress['failed_chunks']} failed"
-                )
-
 
         # Get processing summary
         summary = processor.get_summary()
@@ -1447,8 +1425,7 @@ def resume_checkpoints(timer: func.TimerRequest) -> None:
                 logging.info(f"✅ Sync {sync_id} fully completed! Cleaning up checkpoint files.")
                 checkpoint_manager.cleanup()
 
-                # Update sync metadata to SUCCESS
-                from helpers.postgres_client import update_sync_metadata
+                # Update sync metadata to SUCCESS (function already imported at top)
                 update_sync_metadata(
                     sync_id=sync_id,
                     file_name=file_name,
