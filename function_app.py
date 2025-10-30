@@ -797,7 +797,10 @@ def _run_streaming_pipeline_with_checkpoints(
                 )
 
             except Exception as chunk_error:
-                logging.error(f"❌ Chunk {chunk_id} failed: {chunk_error}")
+                import sys
+                logging.error(f"❌ Chunk {chunk_id} failed: {chunk_error}", exc_info=True)
+                sys.stdout.flush()
+                sys.stderr.flush()
 
                 # Mark chunk as failed
                 checkpoint_manager.mark_chunk_failed(chunk_id, str(chunk_error))
@@ -810,6 +813,7 @@ def _run_streaming_pipeline_with_checkpoints(
                     raise
 
                 logging.warning(f"Continuing to next chunk (chunk {chunk_id} will retry on next run)")
+                sys.stdout.flush()
 
         # Get processing summary
         summary = processor.get_summary()

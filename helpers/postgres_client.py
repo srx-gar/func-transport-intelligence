@@ -57,8 +57,23 @@ def get_postgres_connection():
             dbname=dbname,
             user=user,
             password=password,
-            sslmode=sslmode
+            sslmode=sslmode,
+            connect_timeout=30,  # 30 second connection timeout
+            keepalives=1,        # Enable TCP keepalives
+            keepalives_idle=60,  # Start keepalives after 60s of inactivity
+            keepalives_interval=10,  # Send keepalive every 10s
+            keepalives_count=5   # Drop connection after 5 failed keepalives
         )
+
+    # Set statement timeout to prevent individual queries from running too long
+    # This helps detect stuck queries faster
+    try:
+        cursor = conn.cursor()
+        # Set statement timeout to 5 minutes (300000ms)
+        cursor.execute("SET statement_timeout = '300000'")
+        cursor.close()
+    except Exception as e:
+        logging.warning(f"Could not set statement timeout: {e}")
 
     return conn
 
@@ -264,6 +279,9 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
 
     records_inserted = 0
     records_updated = 0
+
+    import sys
+    import time
 
     try:
         # Resolve target table columns from information_schema to avoid schema drift issues
@@ -717,23 +735,38 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
             # debug suppressed: built no-conn INSERT query
 
         # Execute batch insert with pagination
-        batch_size = 1000
+        # Reduce batch size for tables with many columns to avoid timeout
+        # 86 columns * 500 rows = 43,000 parameters (well under PostgreSQL's 65,535 limit)
+        batch_size = 500
+
+        total_batches = (len(values) + batch_size - 1) // batch_size
+        logging.info(f"Starting batch upsert: {len(values)} rows in {total_batches} batches of {batch_size}")
         for i in range(0, len(values), batch_size):
             batch = values[i:i + batch_size]
+            batch_num = i // batch_size + 1
 
             # Log the query for debugging (only first batch)
             if i == 0:
                 # Only log the first-batch size at INFO; avoid logging parameter tuples
                 logging.info('Executing upsert first batch (size=%s)', len(batch))
 
-            results = execute_values(
-                cursor,
-                insert_query_str,
-                batch,
-                template=None,
-                page_size=batch_size,
-                fetch=True
-            )
+            batch_start = time.time()
+            try:
+                results = execute_values(
+                    cursor,
+                    insert_query_str,
+                    batch,
+                    template=None,
+                    page_size=batch_size,
+                    fetch=True
+                )
+            except Exception as batch_error:
+                logging.error(f"❌ Batch {batch_num}/{total_batches} failed: {batch_error}")
+                sys.stdout.flush()
+                sys.stderr.flush()
+                raise
+
+            batch_duration = time.time() - batch_start
 
             # Count inserts vs updates
             batch_inserts = 0
@@ -746,14 +779,35 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                     records_updated += 1
                     batch_updates += 1
 
-            logging.info('Batch %s: %s inserted, %s updated (total so far: %s inserted, %s updated)', i // batch_size + 1, batch_inserts, batch_updates, records_inserted, records_updated)
+            logging.info('Batch %s/%s: %s inserted, %s updated (%.2fs) | Total: %s inserted, %s updated',
+                        batch_num, total_batches, batch_inserts, batch_updates, batch_duration,
+                        records_inserted, records_updated)
 
+            # Force log flush every 10 batches to ensure progress is visible
+            if batch_num % 10 == 0:
+                sys.stdout.flush()
+                sys.stderr.flush()
+
+        # All batches executed, now commit
+        logging.info(f"✅ All {total_batches} batches executed. Committing transaction...")
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+        commit_start = time.time()
         conn.commit()
-        logging.info(f"Upsert completed: {records_inserted} inserted, {records_updated} updated")
+        commit_duration = time.time() - commit_start
+
+        logging.info(f"✅ Upsert committed in {commit_duration:.2f}s: {records_inserted} inserted, {records_updated} updated")
+        sys.stdout.flush()
+        sys.stderr.flush()
 
     except Exception as e:
+        logging.error(f"❌ Upsert failed: {str(e)}", exc_info=True)
+        sys.stdout.flush()
+        sys.stderr.flush()
         conn.rollback()
-        logging.error(f"Upsert failed: {str(e)}")
+        logging.error(f"Transaction rolled back")
+        sys.stdout.flush()
         raise
     finally:
         cursor.close()
