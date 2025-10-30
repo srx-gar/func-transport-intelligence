@@ -815,6 +815,19 @@ def _run_streaming_pipeline_with_checkpoints(
         summary = processor.get_summary()
         progress = checkpoint_manager.get_progress_summary()
 
+        # Diagnostic logging to identify any discrepancies
+        if summary['records_inserted'] != progress['total_records_inserted'] or \
+           summary['records_updated'] != progress['total_records_updated']:
+            logging.warning(
+                "⚠️  Discrepancy detected between processor and checkpoint manager counts: "
+                "processor={inserted=%s, updated=%s} vs checkpoint={inserted=%s, updated=%s}. "
+                "Using checkpoint manager values (more accurate).",
+                summary['records_inserted'],
+                summary['records_updated'],
+                progress['total_records_inserted'],
+                progress['total_records_updated']
+            )
+
         # Refresh materialized views
         if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
             refresh_materialized_views()
@@ -832,14 +845,16 @@ def _run_streaming_pipeline_with_checkpoints(
         else:
             status = 'SUCCESS'
 
-        # Update sync metadata
+        # Update sync metadata - use checkpoint manager's tracked values for accuracy
+        # The checkpoint manager tracks what was actually committed to DB per chunk,
+        # while the processor summary may be incomplete if chunks failed mid-processing
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
             status=status,
             records_total=summary['total_rows'],
-            records_inserted=summary['records_inserted'],
-            records_updated=summary['records_updated'],
+            records_inserted=progress['total_records_inserted'],
+            records_updated=progress['total_records_updated'],
             records_failed=summary['failed_rows'],
             validation_errors=summary['validation_errors'] if summary['validation_errors'] else None,
         )
@@ -874,6 +889,10 @@ def _run_streaming_pipeline_with_checkpoints(
         rows_per_minute = total_rows / duration_minutes if duration_minutes > 0 else 0
         rows_per_second = total_rows / duration_seconds if duration_seconds > 0 else 0
 
+        # Use checkpoint manager's tracked values for accurate reporting
+        records_inserted = progress['total_records_inserted']
+        records_updated = progress['total_records_updated']
+
         logging.info(
             "Checkpointed streaming sync %s completed (%s): "
             "inserted=%s updated=%s errors=%s | "
@@ -881,8 +900,8 @@ def _run_streaming_pipeline_with_checkpoints(
             "Chunks: %s total, %s completed, %s failed",
             sync_id,
             status,
-            summary['records_inserted'],
-            summary['records_updated'],
+            records_inserted,
+            records_updated,
             summary['failed_rows'],
             total_rows,
             duration_minutes,
@@ -900,8 +919,8 @@ def _run_streaming_pipeline_with_checkpoints(
             'file_name': file_name,
             'file_path': blob_path,
             'records_total': total_rows,
-            'records_inserted': summary['records_inserted'],
-            'records_updated': summary['records_updated'],
+            'records_inserted': records_inserted,
+            'records_updated': records_updated,
             'records_failed': summary['failed_rows'],
             'duration_seconds': round(duration_seconds, 2),
             'duration_minutes': round(duration_minutes, 2),
