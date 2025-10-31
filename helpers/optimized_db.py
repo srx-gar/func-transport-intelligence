@@ -73,7 +73,7 @@ def _normalize_cell_value(v):
     # String normalization
     if isinstance(v, str):
         s = _strip_caret_tilde(v).strip()
-        if s == '' or s.lower() in {'~', 'null', 'none', 'nat'}:
+        if s == '' or s.lower() in {'~', 'null', 'none', 'nat', 'nan', '<na>'}:
             return None
         if 'nat' in s.lower():
             return None

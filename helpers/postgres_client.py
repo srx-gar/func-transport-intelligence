@@ -688,7 +688,13 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                 all_pks = [row[pk_col_index] for row in values]
 
                 # CRITICAL: Check for NULL primary keys before attempting upsert
-                null_pks = [(i, pk) for i, pk in enumerate(all_pks) if pk is None or pk == '' or str(pk).strip() == '']
+                null_pks = [
+                    (i, pk) for i, pk in enumerate(all_pks)
+                    if pk is None
+                    or pk == ''
+                    or (isinstance(pk, str) and pk.strip() in ('', 'None', 'null', 'NULL', 'nan', 'NaN', 'NAN', '<NA>'))
+                    or str(pk).strip() in ('', 'None', 'null', 'NULL', 'nan', 'NaN', 'NAN', '<NA>')
+                ]
                 if null_pks:
                     logging.error(
                         "❌ FATAL: Found %d NULL/empty primary keys in batch before upsert!",

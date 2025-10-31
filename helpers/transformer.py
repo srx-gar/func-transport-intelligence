@@ -301,23 +301,25 @@ def _vectorized_primary_key_series(series: pd.Series) -> pd.Series:
     Special handler for primary key column - converts NULL/empty values to None for filtering.
     Strips delimiters and whitespace, marks invalid values as None to be filtered out later.
     """
-    # Convert to string and strip whitespace
-    result = series.astype(str).str.strip()
+    # Start with None for all NaN/NA values in the original series
+    result = pd.Series([None] * len(series), index=series.index, dtype=object)
 
-    # Remove common delimiters that might be in the data
-    result = result.str.lstrip('^').str.rstrip('~')
-    result = result.str.strip()
+    # Identify non-null values in the original series
+    valid_mask = series.notna()
 
-    # Convert truly empty strings and explicit NULL placeholders to None
-    result = result.replace(['', '~', 'NULL', 'null', 'None'], None)
+    if valid_mask.any():
+        # Convert valid values to string and clean them
+        cleaned = series[valid_mask].astype(str).str.strip()
 
-    # CRITICAL: Also convert 'nan' string to None - these come from pandas converting actual NaN
-    # We want to filter these out since they represent missing primary keys
-    result = result.replace(['nan', 'NaN', 'NAN'], None)
+        # Remove common delimiters
+        cleaned = cleaned.str.lstrip('^').str.rstrip('~').str.strip()
 
-    # Set to None if the original value was actually NaN/None in the source
-    original_is_null = series.isna()
-    result[original_is_null] = None
+        # Create mask for invalid string values
+        invalid_strings = cleaned.isin(['', '~', 'NULL', 'null', 'None', 'nan', 'NaN', 'NAN', '<NA>'])
+
+        # Only keep values that are not invalid
+        result[valid_mask & ~invalid_strings] = cleaned[~invalid_strings]
+        # result remains None for invalid strings
 
     return result
 
@@ -477,7 +479,11 @@ def transform_to_transport_documents(
         (pk_series_early == 'nan') |
         (pk_series_early == 'NaN') |
         (pk_series_early == 'NAN') |
-        (pk_series_early.astype(str).str.strip() == '')
+        (pk_series_early == '<NA>') |
+        (pk_series_early.astype(str).str.strip() == '') |
+        (pk_series_early.astype(str).str.strip() == 'None') |
+        (pk_series_early.astype(str).str.strip() == 'nan') |
+        (pk_series_early.astype(str).str.strip() == '<NA>')
     )
     null_pk_count_early = null_pk_mask_early.sum()
 
@@ -510,7 +516,7 @@ def transform_to_transport_documents(
 
     # FINAL: Filter out rows with NULL primary key to prevent database constraint violations
     # Re-check after reordering in case something changed
-    # Check for: None, NaN, empty string, 'None' string, 'nan' string, pd.NA
+    # Check for: None, NaN, empty string, 'None' string, 'nan' string, '<NA>', pd.NA
     pk_series = transformed['surat_pengantar_barang']
     null_pk_mask = (
         pk_series.isna() |
@@ -519,7 +525,11 @@ def transform_to_transport_documents(
         (pk_series == 'nan') |
         (pk_series == 'NaN') |
         (pk_series == 'NAN') |
-        (pk_series.astype(str).str.strip() == '')
+        (pk_series == '<NA>') |
+        (pk_series.astype(str).str.strip() == '') |
+        (pk_series.astype(str).str.strip() == 'None') |
+        (pk_series.astype(str).str.strip() == 'nan') |
+        (pk_series.astype(str).str.strip() == '<NA>')
     )
     null_pk_count = null_pk_mask.sum()
 
