@@ -98,7 +98,43 @@ class ChunkedPipelineProcessor:
         # Step 2: Transform chunk
         transformed_chunk = transform_to_transport_documents(chunk_df, self.sync_id, self.file_name)
 
-        # Additional safety check: ensure no NULL primary keys after transformation
+        # CRITICAL SAFETY CHECK: Filter out any rows with NULL primary keys that somehow got through
+        # This is the last line of defense before database insert
+        if 'surat_pengantar_barang' in transformed_chunk.columns:
+            pk_series = transformed_chunk['surat_pengantar_barang']
+            null_pk_mask = (
+                pk_series.isna() |
+                (pk_series == '') |
+                (pk_series == 'None') |
+                (pk_series == 'nan') |
+                (pk_series == 'NaN') |
+                (pk_series == 'NAN') |
+                (pk_series == '<NA>') |
+                (pk_series == 'null') |
+                (pk_series == 'NULL') |
+                (pk_series.astype(str).str.strip() == '') |
+                (pk_series.astype(str).str.strip().isin(['None', 'nan', 'NaN', 'NAN', '<NA>', 'null', 'NULL']))
+            )
+            null_pk_count = null_pk_mask.sum()
+
+            if null_pk_count > 0:
+                logging.error(
+                    f"❌ CRITICAL: Found {null_pk_count} NULL primary keys in transformed chunk {self.chunk_count} - FILTERING THEM OUT"
+                )
+                # Log samples for debugging
+                null_pk_indices = transformed_chunk[null_pk_mask].index[:5].tolist()
+                for idx in null_pk_indices[:3]:
+                    pk_val = transformed_chunk.loc[idx, 'surat_pengantar_barang']
+                    logging.error(f"  Row {idx}: surat_pengantar_barang='{pk_val}' (type: {type(pk_val).__name__})")
+
+                # FORCE REMOVE these rows
+                transformed_chunk = transformed_chunk[~null_pk_mask].copy()
+                logging.error(f"  Removed {null_pk_count} rows with NULL primary keys from chunk")
+
+                # Track as failed rows
+                self.failed_rows += null_pk_count
+
+        # Additional safety check: ensure we have data after filtering
         if len(transformed_chunk) == 0:
             logging.warning("Transformation returned empty DataFrame (all rows filtered), skipping upsert")
             return (0, 0)
