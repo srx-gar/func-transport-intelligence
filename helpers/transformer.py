@@ -298,8 +298,8 @@ def _vectorized_string_series(series: pd.Series) -> pd.Series:
 
 def _vectorized_primary_key_series(series: pd.Series) -> pd.Series:
     """
-    Special handler for primary key column - more conservative about NULL conversion.
-    Only converts truly empty values, not 'nan' string which might be legitimate data.
+    Special handler for primary key column - converts NULL/empty values to None for filtering.
+    Strips delimiters and whitespace, marks invalid values as None to be filtered out later.
     """
     # Convert to string and strip whitespace
     result = series.astype(str).str.strip()
@@ -308,15 +308,16 @@ def _vectorized_primary_key_series(series: pd.Series) -> pd.Series:
     result = result.str.lstrip('^').str.rstrip('~')
     result = result.str.strip()
 
-    # Only convert truly empty strings and explicit NULL placeholders
-    # Do NOT convert 'nan' as it might be from pandas conversion of actual data
-    result = result.replace(['', '~', 'NULL', 'null'], None)
+    # Convert truly empty strings and explicit NULL placeholders to None
+    result = result.replace(['', '~', 'NULL', 'null', 'None'], None)
 
-    # Additional check: if the original series had non-null values but result is 'nan' string,
-    # it means pandas converted some value to string 'nan' - keep those as-is since they came from data
-    # Only set to None if the original value was actually NaN/None
+    # CRITICAL: Also convert 'nan' string to None - these come from pandas converting actual NaN
+    # We want to filter these out since they represent missing primary keys
+    result = result.replace(['nan', 'NaN', 'NAN'], None)
+
+    # Set to None if the original value was actually NaN/None in the source
     original_is_null = series.isna()
-    result[original_is_null & (result == 'nan')] = None
+    result[original_is_null] = None
 
     return result
 
@@ -468,20 +469,29 @@ def transform_to_transport_documents(
     # CRITICAL: Check for NULL primary keys BEFORE reordering columns
     # This catches issues early and logs the exact source
     initial_count = len(transformed)
-    null_pk_mask = transformed['surat_pengantar_barang'].isna() | (transformed['surat_pengantar_barang'] == '') | (transformed['surat_pengantar_barang'] == 'None')
-    null_pk_count = null_pk_mask.sum()
+    pk_series_early = transformed['surat_pengantar_barang']
+    null_pk_mask_early = (
+        pk_series_early.isna() |
+        (pk_series_early == '') |
+        (pk_series_early == 'None') |
+        (pk_series_early == 'nan') |
+        (pk_series_early == 'NaN') |
+        (pk_series_early == 'NAN') |
+        (pk_series_early.astype(str).str.strip() == '')
+    )
+    null_pk_count_early = null_pk_mask_early.sum()
 
-    if null_pk_count > 0:
+    if null_pk_count_early > 0:
         logging.warning(
             "⚠️  BEFORE REORDERING: Found %d rows with NULL/empty primary key - will filter after adding audit columns",
-            null_pk_count
+            null_pk_count_early
         )
         # Log sample of original source values for these rows
-        null_indices = transformed[null_pk_mask].index[:5].tolist()
-        for idx in null_indices:
+        null_indices = transformed[null_pk_mask_early].index[:5].tolist()
+        for idx in null_indices[:3]:
             orig_val = df.loc[idx, 'surat_pengantar_brg'] if 'surat_pengantar_brg' in df.columns and idx in df.index else 'N/A'
             trans_val = transformed.loc[idx, 'surat_pengantar_barang']
-            logging.warning(f"  Row {idx}: source='{orig_val}' → transformed='{trans_val}'")
+            logging.warning(f"  Row {idx}: source='{orig_val}' → transformed='{trans_val}' (type: {type(trans_val)})")
 
     # Ensure all expected columns exist even if missing from source
     for column in TARGET_COLUMNS:
@@ -500,7 +510,17 @@ def transform_to_transport_documents(
 
     # FINAL: Filter out rows with NULL primary key to prevent database constraint violations
     # Re-check after reordering in case something changed
-    null_pk_mask = transformed['surat_pengantar_barang'].isna() | (transformed['surat_pengantar_barang'] == '') | (transformed['surat_pengantar_barang'] == 'None')
+    # Check for: None, NaN, empty string, 'None' string, 'nan' string, pd.NA
+    pk_series = transformed['surat_pengantar_barang']
+    null_pk_mask = (
+        pk_series.isna() |
+        (pk_series == '') |
+        (pk_series == 'None') |
+        (pk_series == 'nan') |
+        (pk_series == 'NaN') |
+        (pk_series == 'NAN') |
+        (pk_series.astype(str).str.strip() == '')
+    )
     null_pk_count = null_pk_mask.sum()
 
     if null_pk_count > 0:
@@ -514,6 +534,11 @@ def transform_to_transport_documents(
             "Sample NULL PK row indices: %s (check source data at these positions)",
             null_pk_indices
         )
+        # Log the actual values for debugging
+        for idx in null_pk_indices[:3]:
+            pk_val = transformed.loc[idx, 'surat_pengantar_barang']
+            logging.warning(f"  Row {idx}: surat_pengantar_barang='{pk_val}' (type: {type(pk_val)})")
+
         transformed = transformed[~null_pk_mask].copy()
         logging.warning(
             "Reduced from %d to %d rows after filtering NULL primary keys",
