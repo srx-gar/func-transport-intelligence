@@ -687,6 +687,24 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                 sample_pks = [row[pk_col_index] for row in values[:10]]
                 all_pks = [row[pk_col_index] for row in values]
 
+                # CRITICAL: Check for NULL primary keys before attempting upsert
+                null_pks = [(i, pk) for i, pk in enumerate(all_pks) if pk is None or pk == '' or str(pk).strip() == '']
+                if null_pks:
+                    logging.error(
+                        "❌ FATAL: Found %d NULL/empty primary keys in batch before upsert!",
+                        len(null_pks)
+                    )
+                    # Log first few for debugging
+                    for i, pk in null_pks[:5]:
+                        logging.error(f"  NULL PK at batch index {i}: value='{pk}' (type={type(pk).__name__})")
+                        # Log the full row for this bad PK
+                        logging.error(f"  Full row: {values[i][:10]}...")  # First 10 columns
+
+                    raise ValueError(
+                        f"Cannot upsert: {len(null_pks)} rows have NULL/empty primary key. "
+                        f"This should have been filtered earlier. Check transformer and validator logic."
+                    )
+
                 # Build canonical forms (alphanumeric only, lowercase) to compare robustly
                 def _canon(pk):
                     try:

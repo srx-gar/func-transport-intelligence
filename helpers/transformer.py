@@ -296,6 +296,31 @@ def _vectorized_string_series(series: pd.Series) -> pd.Series:
     return result
 
 
+def _vectorized_primary_key_series(series: pd.Series) -> pd.Series:
+    """
+    Special handler for primary key column - more conservative about NULL conversion.
+    Only converts truly empty values, not 'nan' string which might be legitimate data.
+    """
+    # Convert to string and strip whitespace
+    result = series.astype(str).str.strip()
+
+    # Remove common delimiters that might be in the data
+    result = result.str.lstrip('^').str.rstrip('~')
+    result = result.str.strip()
+
+    # Only convert truly empty strings and explicit NULL placeholders
+    # Do NOT convert 'nan' as it might be from pandas conversion of actual data
+    result = result.replace(['', '~', 'NULL', 'null'], None)
+
+    # Additional check: if the original series had non-null values but result is 'nan' string,
+    # it means pandas converted some value to string 'nan' - keep those as-is since they came from data
+    # Only set to None if the original value was actually NaN/None
+    original_is_null = series.isna()
+    result[original_is_null & (result == 'nan')] = None
+
+    return result
+
+
 def _vectorized_decimal_series(series: pd.Series) -> pd.Series:
     """Fast vectorized decimal conversion."""
     # Try direct numeric conversion first
@@ -350,8 +375,10 @@ def transform_to_transport_documents(
 
     transformed = pd.DataFrame(index=df.index)
 
+    # CRITICAL: Use special handler for primary key to prevent NULL conversion
+    transformed['surat_pengantar_barang'] = _vectorized_primary_key_series(df['surat_pengantar_brg']) if 'surat_pengantar_brg' in df.columns else pd.Series([None] * len(df), index=df.index)
+
     # Direct mappings with optional conversions
-    transformed['surat_pengantar_barang'] = _get_series(df, 'surat_pengantar_brg', _string_value)
     transformed['waktu_buat'] = _combine_datetime_series(df, 'tanggal_buat', 'waktu_buat')
     transformed['no_tiket'] = _get_series(df, 'no_tiket', _string_value)
     transformed['transporter'] = _get_series(df, 'transporter', _string_value)
@@ -438,6 +465,24 @@ def transform_to_transport_documents(
     transformed['ztdw_enhancement'] = _get_series(df, 'ztdw_enhancement', _bool_value)
     transformed['changed_time'] = _get_series(df, 'change_time', _string_value)
 
+    # CRITICAL: Check for NULL primary keys BEFORE reordering columns
+    # This catches issues early and logs the exact source
+    initial_count = len(transformed)
+    null_pk_mask = transformed['surat_pengantar_barang'].isna() | (transformed['surat_pengantar_barang'] == '') | (transformed['surat_pengantar_barang'] == 'None')
+    null_pk_count = null_pk_mask.sum()
+
+    if null_pk_count > 0:
+        logging.warning(
+            "⚠️  BEFORE REORDERING: Found %d rows with NULL/empty primary key - will filter after adding audit columns",
+            null_pk_count
+        )
+        # Log sample of original source values for these rows
+        null_indices = transformed[null_pk_mask].index[:5].tolist()
+        for idx in null_indices:
+            orig_val = df.loc[idx, 'surat_pengantar_brg'] if 'surat_pengantar_brg' in df.columns and idx in df.index else 'N/A'
+            trans_val = transformed.loc[idx, 'surat_pengantar_barang']
+            logging.warning(f"  Row {idx}: source='{orig_val}' → transformed='{trans_val}'")
+
     # Ensure all expected columns exist even if missing from source
     for column in TARGET_COLUMNS:
         if column not in transformed.columns:
@@ -453,10 +498,9 @@ def transform_to_transport_documents(
     transformed['sync_id'] = sync_id
     transformed['source_file'] = file_name
 
-    # CRITICAL: Filter out rows with NULL primary key to prevent database constraint violations
-    # This is a safety check in addition to validation
-    initial_count = len(transformed)
-    null_pk_mask = transformed['surat_pengantar_barang'].isna() | (transformed['surat_pengantar_barang'] == '')
+    # FINAL: Filter out rows with NULL primary key to prevent database constraint violations
+    # Re-check after reordering in case something changed
+    null_pk_mask = transformed['surat_pengantar_barang'].isna() | (transformed['surat_pengantar_barang'] == '') | (transformed['surat_pengantar_barang'] == 'None')
     null_pk_count = null_pk_mask.sum()
 
     if null_pk_count > 0:
