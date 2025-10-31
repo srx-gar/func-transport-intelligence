@@ -87,7 +87,7 @@ class ChunkedPipelineProcessor:
 
             # Remove invalid rows from chunk
             invalid_indices = sorted(failed_row_indices)
-            chunk_df = chunk_df.drop(index=invalid_indices)
+            chunk_df = chunk_df.drop(index=invalid_indices).reset_index(drop=True)
             logging.info(f"Removed {len(invalid_indices)} invalid rows from chunk")
 
         # If all rows in chunk were invalid, return early
@@ -97,6 +97,11 @@ class ChunkedPipelineProcessor:
 
         # Step 2: Transform chunk
         transformed_chunk = transform_to_transport_documents(chunk_df, self.sync_id, self.file_name)
+
+        # Additional safety check: ensure no NULL primary keys after transformation
+        if len(transformed_chunk) == 0:
+            logging.warning("Transformation returned empty DataFrame (all rows filtered), skipping upsert")
+            return (0, 0)
 
         # Step 3: Upsert chunk to database
         try:

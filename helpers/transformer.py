@@ -453,8 +453,32 @@ def transform_to_transport_documents(
     transformed['sync_id'] = sync_id
     transformed['source_file'] = file_name
 
+    # CRITICAL: Filter out rows with NULL primary key to prevent database constraint violations
+    # This is a safety check in addition to validation
+    initial_count = len(transformed)
+    null_pk_mask = transformed['surat_pengantar_barang'].isna() | (transformed['surat_pengantar_barang'] == '')
+    null_pk_count = null_pk_mask.sum()
+
+    if null_pk_count > 0:
+        logging.warning(
+            "⚠️  Found %d rows with NULL/empty primary key (surat_pengantar_barang) after transformation - filtering them out",
+            null_pk_count
+        )
+        # Show sample of NULL PK rows for debugging
+        null_pk_indices = transformed[null_pk_mask].index[:5].tolist()
+        logging.warning(
+            "Sample NULL PK row indices: %s (check source data at these positions)",
+            null_pk_indices
+        )
+        transformed = transformed[~null_pk_mask].copy()
+        logging.warning(
+            "Reduced from %d to %d rows after filtering NULL primary keys",
+            initial_count,
+            len(transformed)
+        )
+
     elapsed = time.time() - start_time
-    rows_per_sec = len(transformed) / elapsed if elapsed > 0 else 0
+    rows_per_sec = initial_count / elapsed if elapsed > 0 else 0
     logging.info(
         "✅ Transformed %d records in %.2f seconds (%.0f rows/sec)",
         len(transformed),
