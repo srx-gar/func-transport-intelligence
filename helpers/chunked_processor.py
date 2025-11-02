@@ -102,19 +102,26 @@ class ChunkedPipelineProcessor:
         # This is the last line of defense before database insert
         if 'surat_pengantar_barang' in transformed_chunk.columns:
             pk_series = transformed_chunk['surat_pengantar_barang']
+
+            # Comprehensive NULL detection - check multiple conditions
+            # Convert to string first to handle all types uniformly
+            pk_str = pk_series.fillna('').astype(str).str.strip()
+
             null_pk_mask = (
-                pk_series.isna() |
-                (pk_series == '') |
-                (pk_series == 'None') |
-                (pk_series == 'nan') |
-                (pk_series == 'NaN') |
-                (pk_series == 'NAN') |
-                (pk_series == '<NA>') |
-                (pk_series == 'null') |
-                (pk_series == 'NULL') |
-                (pk_series.astype(str).str.strip() == '') |
-                (pk_series.astype(str).str.strip().isin(['None', 'nan', 'NaN', 'NAN', '<NA>', 'null', 'NULL']))
+                pk_series.isna() |  # pandas NA/NaN/None
+                (pk_str == '') |  # Empty string after strip
+                (pk_str == 'None') |
+                (pk_str == 'nan') |
+                (pk_str == 'NaN') |
+                (pk_str == 'NAN') |
+                (pk_str == '<NA>') |
+                (pk_str == 'null') |
+                (pk_str == 'NULL') |
+                (pk_str == 'nat') |
+                (pk_str == 'NaT') |
+                (pk_str == 'NAT')
             )
+
             null_pk_count = null_pk_mask.sum()
 
             if null_pk_count > 0:

@@ -314,8 +314,13 @@ def _vectorized_primary_key_series(series: pd.Series) -> pd.Series:
         # Remove common delimiters
         cleaned = cleaned.str.lstrip('^').str.rstrip('~').str.strip()
 
-        # Create mask for invalid string values
-        invalid_strings = cleaned.isin(['', '~', 'NULL', 'null', 'None', 'nan', 'NaN', 'NAN', '<NA>'])
+        # Create mask for invalid string values (comprehensive list)
+        invalid_strings = cleaned.isin([
+            '', '~', 'NULL', 'null', 'None', 'none',
+            'nan', 'NaN', 'NAN', '<NA>', '<na>',
+            'nat', 'NaT', 'NAT',  # datetime NA values
+            'pd.NA', 'pd.NaT'  # pandas NA representations
+        ])
 
         # Only keep values that are not invalid
         result[valid_mask & ~invalid_strings] = cleaned[~invalid_strings]

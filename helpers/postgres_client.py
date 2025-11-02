@@ -697,7 +697,7 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                 ]
                 if null_pks:
                     logging.error(
-                        "❌ FATAL: Found %d NULL/empty primary keys in batch before upsert!",
+                        "⚠️  WARNING: Found %d NULL/empty primary keys in batch - FILTERING THEM OUT",
                         len(null_pks)
                     )
                     # Log first few for debugging
@@ -706,10 +706,24 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                         # Log the full row for this bad PK
                         logging.error(f"  Full row: {values[i][:10]}...")  # First 10 columns
 
-                    raise ValueError(
-                        f"Cannot upsert: {len(null_pks)} rows have NULL/empty primary key. "
-                        f"This should have been filtered earlier. Check transformer and validator logic."
+                    # FILTER OUT rows with NULL primary keys instead of raising error
+                    null_pk_indices = {i for i, pk in null_pks}
+                    values_filtered = [row for i, row in enumerate(values) if i not in null_pk_indices]
+
+                    logging.error(
+                        f"  Filtered out {len(null_pks)} rows with NULL primary keys. "
+                        f"Continuing with {len(values_filtered)} valid rows."
                     )
+
+                    # Update values to use the filtered list
+                    values = values_filtered
+
+                    # If all rows were filtered out, return early with zero inserts/updates
+                    if len(values) == 0:
+                        logging.warning("All rows had NULL primary keys - nothing to upsert")
+                        cursor.close()
+                        conn.close()
+                        return (0, 0)
 
                 # Build canonical forms (alphanumeric only, lowercase) to compare robustly
                 def _canon(pk):
