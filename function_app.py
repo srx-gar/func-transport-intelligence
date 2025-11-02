@@ -381,6 +381,15 @@ def _run_sync_pipeline(
         logging.info("✅ Database upsert complete in %.2f seconds (inserted=%s, updated=%s)",
                      upsert_duration, records_inserted, records_updated)
 
+        # Step 5.5: Upsert drivers to drivers table
+        try:
+            from helpers.postgres_client import upsert_drivers
+            drivers_inserted, drivers_updated = upsert_drivers(sync_id, transformed_df)
+            if drivers_inserted > 0 or drivers_updated > 0:
+                logging.info(f"✅ Drivers upserted: {drivers_inserted} inserted, {drivers_updated} updated")
+        except Exception as driver_error:
+            logging.warning(f"⚠️  Driver upsert failed (non-fatal): {driver_error}")
+
         # Step 6: Refresh dependent materialized views
         if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
             refresh_materialized_views()

@@ -100,6 +100,20 @@ TRUE_VALUES = {'X', '1', 'Y', 'YES', 'TRUE', 'T'}
 FALSE_VALUES = {'0', 'N', 'NO', 'FALSE', 'F'}
 
 
+def _safe_str(value):
+    """Safely convert value to string, handling pandas NA values."""
+    if value is None:
+        return None
+    # Check for pandas NA types before converting to string
+    if pd.isna(value):
+        return None
+    s = str(value)
+    # Double-check: if str() produced '<NA>', convert to None
+    if s in ('<NA>', '<na>', 'nan', 'NaN', 'NAN', 'nat', 'NaT', 'NAT'):
+        return None
+    return s
+
+
 def _normalize_value(value):
     """Standardize placeholder strings to None and strip whitespace."""
     if pd.isna(value):
@@ -114,7 +128,7 @@ def _normalize_value(value):
 
 def _string_value(value):
     normalized = _normalize_value(value)
-    return str(normalized) if normalized is not None else None
+    return _safe_str(normalized) if normalized is not None else None
 
 
 def _decimal_value(value):
@@ -123,7 +137,9 @@ def _decimal_value(value):
         return None
     if isinstance(normalized, (int, float)):
         return float(normalized)
-    text = str(normalized)
+    text = _safe_str(normalized)
+    if text is None:
+        return None
     if ',' in text and '.' in text:
         text = text.replace('.', '').replace(',', '.')
     elif ',' in text:
@@ -156,7 +172,10 @@ def _bool_value(value):
         return None
     if isinstance(normalized, bool):
         return normalized
-    text = str(normalized).strip().upper()
+    text = _safe_str(normalized)
+    if text is None:
+        return None
+    text = text.strip().upper()
     if text in TRUE_VALUES:
         return True
     if text in FALSE_VALUES:
@@ -171,7 +190,9 @@ def _normalize_date_component(value):
     if isinstance(normalized, (pd.Timestamp, datetime)):
         return pd.to_datetime(normalized).strftime('%Y-%m-%d')
 
-    text = str(normalized)
+    text = _safe_str(normalized)
+    if text is None:
+        return None
     if text.isdigit() and len(text) == 8:
         return f"{text[0:4]}-{text[4:6]}-{text[6:8]}"
 
@@ -188,7 +209,10 @@ def _normalize_time_component(value):
     if isinstance(normalized, (pd.Timestamp, datetime)):
         return pd.to_datetime(normalized).strftime('%H:%M:%S')
 
-    text = str(normalized).replace(':', '')
+    text = _safe_str(normalized)
+    if text is None:
+        return None
+    text = text.replace(':', '')
     if not text.isdigit():
         return None
     if set(text) == {'0'}:

@@ -879,6 +879,153 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
     return records_inserted, records_updated
 
 
+def upsert_drivers(sync_id: str, df: pd.DataFrame) -> tuple:
+    """
+    Upsert unique drivers to the drivers table.
+
+    Extracts unique combinations of nik_supir, nama_supir, and transporter
+    from the DataFrame and upserts them to the drivers table.
+
+    Returns (records_inserted, records_updated)
+    """
+    if len(df) == 0:
+        logging.info("Empty DataFrame, skipping driver upsert")
+        return (0, 0)
+
+    # Check if required columns exist
+    required_cols = ['nik_supir', 'nama_supir']
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        logging.warning(f"Missing driver columns {missing_cols}, skipping driver upsert")
+        return (0, 0)
+
+    # Filter out rows where nik_supir or nama_supir is empty/null
+    driver_df = df[required_cols + (['transporter'] if 'transporter' in df.columns else [])].copy()
+
+    # Remove null/empty values
+    driver_df = driver_df[
+        driver_df['nik_supir'].notna() &
+        (driver_df['nik_supir'] != '') &
+        (driver_df['nik_supir'].astype(str).str.strip() != '') &
+        driver_df['nama_supir'].notna() &
+        (driver_df['nama_supir'] != '') &
+        (driver_df['nama_supir'].astype(str).str.strip() != '')
+    ].copy()
+
+    # Additional filtering for <NA> strings
+    driver_df = driver_df[
+        ~driver_df['nik_supir'].astype(str).str.strip().isin(['<NA>', 'nan', 'NaN', 'None', 'null']) &
+        ~driver_df['nama_supir'].astype(str).str.strip().isin(['<NA>', 'nan', 'NaN', 'None', 'null'])
+    ]
+
+    if len(driver_df) == 0:
+        logging.info("No valid driver records to upsert")
+        return (0, 0)
+
+    # Get unique drivers (by nik_supir)
+    driver_df = driver_df.drop_duplicates(subset=['nik_supir'])
+
+    # Rename columns to match drivers table schema
+    driver_df = driver_df.rename(columns={
+        'nik_supir': 'nik',
+        'nama_supir': 'nama'
+    })
+
+    # Add id_karyawan (can be same as nik if not available separately)
+    if 'id_karyawan' not in driver_df.columns:
+        driver_df['id_karyawan'] = driver_df['nik']
+
+    # Add email column (empty if not available)
+    if 'email' not in driver_df.columns:
+        driver_df['email'] = None
+
+    # Select only the columns we need for drivers table
+    driver_cols = ['id_karyawan', 'nik', 'nama', 'email', 'transporter'] if 'transporter' in driver_df.columns else ['id_karyawan', 'nik', 'nama', 'email']
+    driver_df = driver_df[driver_cols]
+
+    logging.info(f"Upserting {len(driver_df)} unique drivers to drivers table")
+
+    if not PSYCOPG_AVAILABLE:
+        raise RuntimeError("psycopg2 is not available; cannot upsert drivers")
+
+    conn = None
+    cursor = None
+    try:
+        conn = get_postgres_connection()
+        cursor = conn.cursor()
+
+        table_schema = os.getenv('DB_SCHEMA', 'public')
+        table_name = 'drivers'
+
+        # Normalize cell values
+        def _normalize_driver_cell(v):
+            if v is None:
+                return None
+            if pd.isna(v):
+                return None
+            if isinstance(v, str):
+                s = v.strip()
+                if s == '' or s.lower() in {'<na>', 'nan', 'null', 'none'}:
+                    return None
+                return s
+            return v
+
+        # Clean the dataframe
+        for col in driver_df.columns:
+            driver_df[col] = driver_df[col].map(_normalize_driver_cell)
+
+        # Build upsert query
+        cols_str = ', '.join([_quote_identifier(c) for c in driver_cols])
+        values_placeholder = ', '.join(['%s'] * len(driver_cols))
+
+        # Use nik as the conflict key
+        update_sets = ', '.join([
+            f"{_quote_identifier(c)} = EXCLUDED.{_quote_identifier(c)}"
+            for c in driver_cols if c != 'nik'
+        ])
+
+        upsert_query = f"""
+            INSERT INTO {_quote_identifier(table_schema)}.{_quote_identifier(table_name)} 
+            ({cols_str}) 
+            VALUES ({values_placeholder})
+            ON CONFLICT (nik) DO UPDATE SET {update_sets}
+            RETURNING (xmax = 0) AS inserted
+        """
+
+        # Convert to list of tuples
+        values = [tuple(row) for row in driver_df.to_numpy()]
+
+        records_inserted = 0
+        records_updated = 0
+
+        # Execute in batches
+        batch_size = 100
+        for i in range(0, len(values), batch_size):
+            batch = values[i:i + batch_size]
+
+            for row_values in batch:
+                cursor.execute(upsert_query, row_values)
+                result = cursor.fetchone()
+                if result and result[0]:
+                    records_inserted += 1
+                else:
+                    records_updated += 1
+
+        conn.commit()
+        logging.info(f"✅ Driver upsert complete: {records_inserted} inserted, {records_updated} updated")
+
+        cursor.close()
+        conn.close()
+
+        return records_inserted, records_updated
+
+    except Exception as e:
+        logging.error(f"❌ Driver upsert failed: {str(e)}", exc_info=True)
+        if conn:
+            conn.rollback()
+        raise
+
+
 def update_sync_metadata(sync_id: str, file_name: str = None, file_path: str = None,
                          file_size_bytes: int = None, status: str = None,
                          records_total: int = None, records_inserted: int = None,

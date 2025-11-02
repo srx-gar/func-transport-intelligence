@@ -157,6 +157,16 @@ class ChunkedPipelineProcessor:
             # Re-raise to let the chunk processor handle it
             raise
 
+        # Step 4: Upsert drivers (if nik_supir and nama_supir are present)
+        try:
+            from helpers.postgres_client import upsert_drivers
+            drivers_inserted, drivers_updated = upsert_drivers(self.sync_id, transformed_chunk)
+            if drivers_inserted > 0 or drivers_updated > 0:
+                logging.info(f"  Drivers: {drivers_inserted} inserted, {drivers_updated} updated")
+        except Exception as driver_error:
+            # Don't fail the whole chunk if driver upsert fails
+            logging.warning(f"⚠️  Driver upsert failed (non-fatal): {driver_error}")
+
         self.records_inserted += chunk_inserted
         self.records_updated += chunk_updated
 
