@@ -292,7 +292,7 @@ def _vectorized_string_series(series: pd.Series) -> pd.Series:
     """Fast vectorized string normalization."""
     # Replace empty strings and placeholders with None
     result = series.astype(str).str.strip()
-    result = result.replace(['', '~', 'NULL', 'null', 'None', 'nan'], None)
+    result = result.replace(['', '~', 'NULL', 'null', 'None', 'nan', 'NaN', 'NAN', '<NA>'], None)
     return result
 
 

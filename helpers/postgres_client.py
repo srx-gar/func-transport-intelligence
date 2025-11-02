@@ -462,7 +462,7 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                 if s == '':
                     return None
                 low = s.lower()
-                if low in {'~', 'null', 'none', 'nat'}:
+                if low in {'~', 'null', 'none', 'nat', '<na>'}:
                     return None
                 # if 'nat' appears anywhere, treat as missing
                 if 'nat' in low:
@@ -481,9 +481,11 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
             # None/null remains None
             if v is None:
                 return None
-            # Strings containing nat anywhere -> None
-            if isinstance(v, str) and 'nat' in v.lower():
-                return None
+            # Strings containing nat anywhere or <NA> -> None
+            if isinstance(v, str):
+                v_lower = v.lower()
+                if 'nat' in v_lower or v_lower == '<na>':
+                    return None
             # pandas/np NA
             try:
                 if pd.isna(v):
@@ -552,9 +554,11 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                         return pd.to_datetime(v).to_pydatetime()
                     except Exception:
                         return None
-                # strings containing nat anywhere
-                if isinstance(v, str) and 'nat' in v.lower():
-                    return None
+                # strings containing nat anywhere or '<NA>'
+                if isinstance(v, str):
+                    v_lower = v.lower()
+                    if 'nat' in v_lower or v_lower == '<na>':
+                        return None
                 # attempt parsing strings
                 if isinstance(v, str):
                     parsed = pd.to_datetime(v, errors='coerce')
@@ -578,9 +582,11 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
         def _finalize_datetime_cell(v):
             if v is None:
                 return None
-            # treat strings containing 'nat' (case-insensitive) as missing
-            if isinstance(v, str) and 'nat' in v.lower():
-                return None
+            # treat strings containing 'nat' (case-insensitive) or '<NA>' as missing
+            if isinstance(v, str):
+                v_lower = v.lower()
+                if 'nat' in v_lower or v_lower == '<na>':
+                    return None
             # already a python datetime
             try:
                 import datetime as _dt
@@ -641,7 +647,7 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
             df_clean['surat_pengantar_barang'] = df_clean['surat_pengantar_barang'].map(_normalize_pk)
 
         # Build the values tuples from the sanitized DataFrame; ensure any lingering
-        # string tokens that look like 'nat' are coerced to None as a last resort.
+        # string tokens that look like 'nat' or '<NA>' are coerced to None as a last resort.
         def _final_sanitize_for_sql(x):
             # pandas/NumPy NA-like
             try:
@@ -661,11 +667,12 @@ def upsert_to_postgres(sync_id: str, df: pd.DataFrame) -> tuple:
                     return pd.to_datetime(x).to_pydatetime()
                 except Exception:
                     return None
-            # strings containing 'nat' -> None
+            # strings containing 'nat' or '<NA>' -> None
             if isinstance(x, str):
                 # Strip marker tokens first
                 sx = _strip_caret_tilde(x)
-                if 'nat' in sx.lower():
+                sx_lower = sx.lower()
+                if 'nat' in sx_lower or sx_lower == '<na>':
                     return None
                 if sx == '':
                     return None
