@@ -1261,6 +1261,14 @@ def refresh_materialized_views():
     When psycopg2 is not available, log the intent. When available, attempt to
     refresh views named in the environment variable `MATERIALIZED_VIEWS` (comma-separated),
     falling back to a default list if not supplied.
+
+    The default list refreshes views in dependency order:
+    1. Base views (depend on tables)
+    2. Daily anomaly (depends on daily consumption)
+    3. Alert views (depend on daily anomaly)
+    4. Aggregated alerts (depends on individual alert views)
+    5. Alert details (depends on aggregated alerts)
+    6. Entity view (standalone)
     """
     logging.info('refresh_materialized_views invoked')
     if not PSYCOPG_AVAILABLE:
@@ -1271,23 +1279,52 @@ def refresh_materialized_views():
     if views:
         view_list = [v.strip() for v in views.split(',') if v.strip()]
     else:
-        # sensible default (no-op if these don't exist)
-        view_list = ['transport_documents_mv']
+        # Default: refresh all views in dependency order
+        view_list = [
+            # Level 1: Base views (depend on transport_documents table)
+            'mv_transport_var',
+            'mv_daily_consumption',
+            'mv_daily_spb_docs',
+            'mv_entities',
+
+            # Level 2: Depends on mv_daily_consumption
+            'mv_daily_anomaly',
+
+            # Level 3: Depends on mv_daily_anomaly and mv_daily_consumption
+            'mv_vehicle_alerts_1d',
+            'mv_vehicle_alerts_7d',
+            'mv_driver_alerts_1d',
+            'mv_driver_alerts_7d',
+            'mv_route_alerts_1d',
+            'mv_route_alerts_7d',
+            'mv_vehicle_monthly_variance',
+            'mv_driver_monthly_variance',
+            'mv_route_monthly_variance',
+
+            # Level 4: Depends on alert views
+            'mv_alerts',
+
+            # Level 5: Depends on mv_alerts and mv_transport_var
+            'mv_alert_details',
+        ]
 
     try:
         conn = get_postgres_connection()
         cur = conn.cursor()
         for v in view_list:
             logging.info('Refreshing materialized view: %s', v)
-            # Try CONCURRENTLY first
+            # Try CONCURRENTLY first (requires unique index on the view)
             try:
                 cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {v}")
-            except Exception:
+                logging.info('Successfully refreshed %s concurrently', v)
+            except Exception as e:
                 # Fallback to non-CONCURRENTLY
-                logging.warning('Could not refresh concurrently, falling back to non-CONCURRENTLY for %s', v)
+                logging.warning('Could not refresh concurrently (%s), falling back to non-CONCURRENTLY for %s', str(e), v)
                 cur.execute(f"REFRESH MATERIALIZED VIEW {v}")
+                logging.info('Successfully refreshed %s (non-concurrently)', v)
         conn.commit()
         cur.close()
         conn.close()
+        logging.info('All materialized views refreshed successfully')
     except Exception as exc:
         logging.exception('Failed to refresh materialized views: %s', exc)
