@@ -1278,6 +1278,7 @@ def refresh_materialized_views():
     views = os.getenv('MATERIALIZED_VIEWS')
     if views:
         view_list = [v.strip() for v in views.split(',') if v.strip()]
+        logging.info(f'Using MATERIALIZED_VIEWS from environment: {view_list}')
     else:
         # Default: refresh all views in dependency order
         view_list = [
@@ -1307,24 +1308,42 @@ def refresh_materialized_views():
             # Level 5: Depends on mv_alerts and mv_transport_var
             'mv_alert_details',
         ]
+        logging.info(f'Using default materialized views list ({len(view_list)} views)')
 
     try:
         conn = get_postgres_connection()
         cur = conn.cursor()
+        refreshed_count = 0
+        failed_views = []
+
         for v in view_list:
-            logging.info('Refreshing materialized view: %s', v)
-            # Try CONCURRENTLY first (requires unique index on the view)
+            logging.info(f'[{refreshed_count + 1}/{len(view_list)}] Refreshing materialized view: {v}')
             try:
-                cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {v}")
-                logging.info('Successfully refreshed %s concurrently', v)
-            except Exception as e:
-                # Fallback to non-CONCURRENTLY
-                logging.warning('Could not refresh concurrently (%s), falling back to non-CONCURRENTLY for %s', str(e), v)
-                cur.execute(f"REFRESH MATERIALIZED VIEW {v}")
-                logging.info('Successfully refreshed %s (non-concurrently)', v)
-        conn.commit()
+                # Try CONCURRENTLY first (requires unique index on the view)
+                try:
+                    cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {v}")
+                    conn.commit()
+                    logging.info(f'✅ Successfully refreshed {v} CONCURRENTLY')
+                    refreshed_count += 1
+                except Exception as e:
+                    # Fallback to non-CONCURRENTLY
+                    logging.warning(f'Could not refresh CONCURRENTLY ({str(e)}), falling back to non-CONCURRENTLY for {v}')
+                    cur.execute(f"REFRESH MATERIALIZED VIEW {v}")
+                    conn.commit()
+                    logging.info(f'✅ Successfully refreshed {v} (non-concurrently)')
+                    refreshed_count += 1
+            except Exception as view_error:
+                failed_views.append(v)
+                logging.error(f'❌ Failed to refresh {v}: {str(view_error)}')
+                # Continue with other views even if one fails
+                continue
+
         cur.close()
         conn.close()
-        logging.info('All materialized views refreshed successfully')
+
+        if failed_views:
+            logging.warning(f'⚠️ Materialized view refresh completed with errors: {refreshed_count}/{len(view_list)} succeeded. Failed: {", ".join(failed_views)}')
+        else:
+            logging.info(f'✅ All {refreshed_count} materialized views refreshed successfully')
     except Exception as exc:
-        logging.exception('Failed to refresh materialized views: %s', exc)
+        logging.exception(f'❌ Failed to refresh materialized views: {exc}')
