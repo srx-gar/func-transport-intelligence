@@ -412,7 +412,13 @@ def _run_sync_pipeline(
         # Finalize status and record counts
         records_failed = failed_rows_count
         # If there were global errors, this would have already raised above
-        status = 'PARTIAL_SUCCESS' if records_failed else 'SUCCESS'
+        # Check if failed rows are due to validation errors (bad input)
+        if records_failed > 0 and validation_errors:
+            status = 'PARTIAL_SUCCESS_BAD_INPUT'
+        elif records_failed > 0:
+            status = 'PARTIAL_SUCCESS'
+        else:
+            status = 'SUCCESS'
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
@@ -596,13 +602,24 @@ def _run_streaming_pipeline(
         global_errors = [e for e in validation_errors if not (isinstance(e, dict) and 'row' in e)]
         failed_rows_count = len({e['row'] for e in row_level_errors})
 
+        # Diagnostic logging for status determination
+        logging.info(
+            f"📊 Validation summary: {len(validation_errors)} total errors "
+            f"({len(global_errors)} global, {len(row_level_errors)} row-level), "
+            f"{failed_rows_count} failed rows"
+        )
+
         # Determine status
         if global_errors and failed_rows_count > 0:
             status = 'PARTIAL_SUCCESS_BAD_INPUT'
         elif global_errors:
             status = 'BAD_INPUT'
         elif failed_rows_count > 0:
-            status = 'PARTIAL_SUCCESS'
+            # Check if failed rows are due to validation errors (bad input)
+            if row_level_errors:
+                status = 'PARTIAL_SUCCESS_BAD_INPUT'
+            else:
+                status = 'PARTIAL_SUCCESS'
         else:
             status = 'SUCCESS'
 
@@ -896,6 +913,13 @@ def _run_streaming_pipeline_with_checkpoints(
         global_errors = [e for e in validation_errors if not (isinstance(e, dict) and 'row' in e)]
         failed_rows_count = summary.get('failed_rows', 0)
 
+        # Diagnostic logging for status determination
+        logging.info(
+            f"📊 Validation summary: {len(validation_errors)} total errors "
+            f"({len(global_errors)} global, {len(row_level_errors)} row-level), "
+            f"{failed_rows_count} failed rows"
+        )
+
         # Diagnostic logging to identify any discrepancies
         if summary['records_inserted'] != progress['total_records_inserted'] or \
            summary['records_updated'] != progress['total_records_updated']:
@@ -937,7 +961,14 @@ def _run_streaming_pipeline_with_checkpoints(
                 f"will retry on next run"
             )
         elif summary.get('failed_rows', 0) > 0:
-            status = 'PARTIAL_SUCCESS'
+            # Check if failed rows are due to validation errors (bad input)
+            if row_level_errors:
+                status = 'PARTIAL_SUCCESS_BAD_INPUT'
+                logging.warning(
+                    f"Sync partially successful with bad input data: {failed_rows_count} validation errors"
+                )
+            else:
+                status = 'PARTIAL_SUCCESS'
         else:
             status = 'SUCCESS'
 
