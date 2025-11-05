@@ -1,0 +1,17 @@
+# Exclude Python cache, venv, git, logs, docs, and test data from deployment
+__pycache__/
+.venv/
+.git/
+.gitignore
+*.pyc
+*.pyo
+*.pyd
+test_data/
+docs/
+LogFiles/
+*.md
+*.log
+*.sqlite
+*.db
+*.DS_Store
+
