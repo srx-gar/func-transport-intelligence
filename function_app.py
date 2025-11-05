@@ -303,7 +303,6 @@ def _run_sync_pipeline(
 
         # If there are global errors (e.g., missing columns), treat them as fatal
         if global_errors:
-            # Include global error message and a short dump of errors for diagnostics
             first_msg = None
             try:
                 first_msg = global_errors[0].get('message', str(global_errors[0])) if isinstance(global_errors[0], dict) else str(global_errors[0])
@@ -314,10 +313,15 @@ def _run_sync_pipeline(
                 f"Validation failed due to global errors: {first_msg} (global_errors_count={len(global_errors)}, total_rows={total_rows})"
             )
             logging.error("Validation stopped: %s; global_errors=%s", error_msg, global_errors[:5])
+            # If there are also row-level errors, use PARTIAL_SUCCESS_BAD_INPUT
+            if failed_rows_count > 0:
+                status = 'PARTIAL_SUCCESS_BAD_INPUT'
+            else:
+                status = 'BAD_INPUT'
             update_sync_metadata(
                 sync_id=sync_id,
                 file_name=file_name,
-                status='FAILED',
+                status=status,
                 records_total=total_rows,
                 records_failed=failed_rows_count + len(global_errors),
                 error_message=error_msg,
@@ -399,6 +403,7 @@ def _run_sync_pipeline(
 
         # Finalize status and record counts
         records_failed = failed_rows_count
+        # If there were global errors, this would have already raised above
         status = 'PARTIAL_SUCCESS' if records_failed else 'SUCCESS'
         update_sync_metadata(
             sync_id=sync_id,
@@ -574,13 +579,20 @@ def _run_streaming_pipeline(
         records_failed = summary['failed_rows']
         validation_errors = summary['validation_errors']
 
-        # Refresh materialized views
-        if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
-            refresh_materialized_views()
-            logging.info("Materialized views refreshed")
+        # Split validation results into row-level errors and global errors
+        row_level_errors = [e for e in validation_errors if isinstance(e, dict) and 'row' in e]
+        global_errors = [e for e in validation_errors if not (isinstance(e, dict) and 'row' in e)]
+        failed_rows_count = len({e['row'] for e in row_level_errors})
 
         # Determine status
-        status = 'PARTIAL_SUCCESS' if records_failed else 'SUCCESS'
+        if global_errors and failed_rows_count > 0:
+            status = 'PARTIAL_SUCCESS_BAD_INPUT'
+        elif global_errors:
+            status = 'BAD_INPUT'
+        elif failed_rows_count > 0:
+            status = 'PARTIAL_SUCCESS'
+        else:
+            status = 'SUCCESS'
 
         # Update final metadata
         update_sync_metadata(
@@ -591,11 +603,20 @@ def _run_streaming_pipeline(
             records_inserted=records_inserted,
             records_updated=records_updated,
             records_failed=records_failed,
+            error_message=global_errors[0].get('message', str(global_errors[0])) if global_errors and isinstance(global_errors[0], dict) else (str(global_errors[0]) if global_errors else None),
             validation_errors=validation_errors if validation_errors else None,
         )
 
         # Send alerts if needed
-        if validation_errors:
+        if global_errors:
+            send_alert_email(
+                sync_id,
+                file_name,
+                f"Sync completed with bad input data: {global_errors[0].get('message', str(global_errors[0])) if global_errors and isinstance(global_errors[0], dict) else (str(global_errors[0]) if global_errors else None)}",
+                validation_errors,
+                is_warning=True,
+            )
+        elif validation_errors:
             send_alert_email(
                 sync_id,
                 file_name,
@@ -1329,5 +1350,4 @@ def manual_sync(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype='application/json',
         )
-
 

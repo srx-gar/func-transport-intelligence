@@ -5,7 +5,6 @@ This shows how to use the optimized processing for large files while
 maintaining backward compatibility with the existing approach.
 """
 
-import gzip
 import json
 import logging
 import os
@@ -55,6 +54,7 @@ def _run_streaming_pipeline(
         status='IN_PROGRESS',
     )
 
+    global_validation_error = None
     try:
         # Determine optimal chunk size based on file size
         file_size = blob_size or len(raw_content)
@@ -78,11 +78,24 @@ def _run_streaming_pipeline(
 
         # Process chunks with backpressure control
         max_buffer = int(os.getenv('MAX_BUFFER_CHUNKS', '2'))
-        summary = process_chunks_with_backpressure(
-            chunk_iterator,
-            processor,
-            max_buffer_chunks=max_buffer
-        )
+        try:
+            summary = process_chunks_with_backpressure(
+                chunk_iterator,
+                processor,
+                max_buffer_chunks=max_buffer
+            )
+        except ValueError as ve:
+            # This is likely a global validation error (bad input data)
+            logging.error(f"Global validation error: {ve}")
+            global_validation_error = str(ve)
+            # We'll check for row-level errors after this block
+            summary = {
+                'total_rows': 0,
+                'records_inserted': 0,
+                'records_updated': 0,
+                'failed_rows': 0,
+                'validation_errors': [],
+            }
 
         # Check for processing errors
         if 'error' in summary:
@@ -103,7 +116,14 @@ def _run_streaming_pipeline(
             logging.info("Materialized view refresh skipped via config")
 
         # Determine status
-        status = 'PARTIAL_SUCCESS' if records_failed else 'SUCCESS'
+        if global_validation_error and records_failed:
+            status = 'PARTIAL_SUCCESS_BAD_INPUT'
+        elif global_validation_error:
+            status = 'BAD_INPUT'
+        elif records_failed:
+            status = 'PARTIAL_SUCCESS'
+        else:
+            status = 'SUCCESS'
 
         # Update final metadata
         update_sync_metadata(
@@ -114,11 +134,20 @@ def _run_streaming_pipeline(
             records_inserted=records_inserted,
             records_updated=records_updated,
             records_failed=records_failed,
+            error_message=global_validation_error if global_validation_error else None,
             validation_errors=validation_errors if validation_errors else None,
         )
 
         # Send alerts if needed
-        if validation_errors:
+        if global_validation_error:
+            send_alert_email(
+                sync_id,
+                file_name,
+                f"Sync completed with bad input data: {global_validation_error}",
+                validation_errors,
+                is_warning=True,
+            )
+        elif validation_errors:
             send_alert_email(
                 sync_id,
                 file_name,
@@ -156,6 +185,7 @@ def _run_streaming_pipeline(
 
     except Exception as exc:
         logging.error("Streaming sync %s failed: %s", sync_id, exc, exc_info=True)
+        # Only update status to FAILED if not already BAD_INPUT
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
@@ -232,4 +262,3 @@ def should_use_streaming(blob_size: Optional[int], raw_content: bytes = None) ->
 #             trigger='blob',
 #             blob_size=myblob.length,
 #         )
-
