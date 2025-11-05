@@ -1310,36 +1310,71 @@ def refresh_materialized_views():
         ]
         logging.info(f'Using default materialized views list ({len(view_list)} views)')
 
+    conn = None
+    cur = None
     try:
+        logging.info('📡 Connecting to database for MV refresh...')
         conn = get_postgres_connection()
+        logging.info('✅ Database connection established')
+
         cur = conn.cursor()
+        logging.info('✅ Cursor created')
+
         refreshed_count = 0
         failed_views = []
 
-        for v in view_list:
-            logging.info(f'[{refreshed_count + 1}/{len(view_list)}] Refreshing materialized view: {v}')
+        for idx, v in enumerate(view_list, start=1):
+            logging.info(f'[{idx}/{len(view_list)}] Refreshing materialized view: {v}')
             try:
+                # Quote the view name properly
+                quoted_view = _quote_identifier(v)
+
                 # Try CONCURRENTLY first (requires unique index on the view)
                 try:
-                    cur.execute(f"REFRESH MATERIALIZED VIEW CONCURRENTLY {v}")
+                    sql_concurrent = f"REFRESH MATERIALIZED VIEW CONCURRENTLY {quoted_view}"
+                    logging.info(f'Executing: {sql_concurrent}')
+                    cur.execute(sql_concurrent)
+                    logging.info(f'Execute completed, now committing...')
                     conn.commit()
                     logging.info(f'✅ Successfully refreshed {v} CONCURRENTLY')
                     refreshed_count += 1
                 except Exception as e:
+                    # Rollback any failed transaction before trying non-concurrent
+                    logging.warning(f'CONCURRENT refresh failed: {str(e)}')
+                    try:
+                        conn.rollback()
+                        logging.info('Rolled back failed transaction')
+                    except Exception as rollback_err:
+                        logging.error(f'Rollback failed: {rollback_err}')
+
                     # Fallback to non-CONCURRENTLY
-                    logging.warning(f'Could not refresh CONCURRENTLY ({str(e)}), falling back to non-CONCURRENTLY for {v}')
-                    cur.execute(f"REFRESH MATERIALIZED VIEW {v}")
+                    logging.warning(f'Falling back to non-CONCURRENT refresh for {v}')
+                    sql_normal = f"REFRESH MATERIALIZED VIEW {quoted_view}"
+                    logging.info(f'Executing: {sql_normal}')
+                    cur.execute(sql_normal)
+                    logging.info(f'Execute completed, now committing...')
                     conn.commit()
                     logging.info(f'✅ Successfully refreshed {v} (non-concurrently)')
                     refreshed_count += 1
             except Exception as view_error:
-                failed_views.append(v)
+                # Rollback failed transaction
                 logging.error(f'❌ Failed to refresh {v}: {str(view_error)}')
+                logging.exception(f'Full exception for {v}:')
+                try:
+                    conn.rollback()
+                    logging.info(f'Rolled back after failure of {v}')
+                except Exception as rollback_err:
+                    logging.error(f'Rollback failed: {rollback_err}')
+                failed_views.append(v)
                 # Continue with other views even if one fails
                 continue
 
-        cur.close()
-        conn.close()
+        if cur:
+            cur.close()
+            logging.info('Cursor closed')
+        if conn:
+            conn.close()
+            logging.info('Connection closed')
 
         if failed_views:
             logging.warning(f'⚠️ Materialized view refresh completed with errors: {refreshed_count}/{len(view_list)} succeeded. Failed: {", ".join(failed_views)}')
@@ -1347,3 +1382,9 @@ def refresh_materialized_views():
             logging.info(f'✅ All {refreshed_count} materialized views refreshed successfully')
     except Exception as exc:
         logging.exception(f'❌ Failed to refresh materialized views: {exc}')
+        if conn:
+            try:
+                conn.rollback()
+                conn.close()
+            except:
+                pass
