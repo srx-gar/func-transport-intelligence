@@ -321,6 +321,8 @@ def _run_sync_pipeline(
             update_sync_metadata(
                 sync_id=sync_id,
                 file_name=file_name,
+                file_path=blob_path,
+                file_size_bytes=blob_size or len(raw_content),
                 status=status,
                 records_total=total_rows,
                 records_failed=failed_rows_count + len(global_errors),
@@ -351,6 +353,8 @@ def _run_sync_pipeline(
                 update_sync_metadata(
                     sync_id=sync_id,
                     file_name=file_name,
+                    file_path=blob_path,
+                    file_size_bytes=blob_size or len(raw_content),
                     status='FAILED',
                     records_total=total_rows,
                     records_failed=total_issues,
@@ -408,6 +412,8 @@ def _run_sync_pipeline(
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
+            file_path=blob_path,
+            file_size_bytes=blob_size or len(raw_content),
             status=status,
             records_total=total_rows,
             records_inserted=records_inserted,
@@ -485,6 +491,8 @@ def _run_sync_pipeline(
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
+            file_path=blob_path,
+            file_size_bytes=blob_size or len(raw_content),
             status='FAILED',
             error_message=str(exc),
         )
@@ -598,6 +606,8 @@ def _run_streaming_pipeline(
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
+            file_path=blob_path,
+            file_size_bytes=blob_size or len(raw_content),
             status=status,
             records_total=total_rows,
             records_inserted=records_inserted,
@@ -673,6 +683,8 @@ def _run_streaming_pipeline(
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
+            file_path=blob_path,
+            file_size_bytes=blob_size or len(raw_content),
             status='FAILED',
             error_message=str(exc),
         )
@@ -874,6 +886,12 @@ def _run_streaming_pipeline_with_checkpoints(
         summary = processor.get_summary()
         progress = checkpoint_manager.get_progress_summary()
 
+        # --- NEW: determine validation error types (global vs row-level) ---
+        validation_errors = summary.get('validation_errors') or []
+        row_level_errors = [e for e in validation_errors if isinstance(e, dict) and 'row' in e]
+        global_errors = [e for e in validation_errors if not (isinstance(e, dict) and 'row' in e)]
+        failed_rows_count = summary.get('failed_rows', 0)
+
         # Diagnostic logging to identify any discrepancies
         if summary['records_inserted'] != progress['total_records_inserted'] or \
            summary['records_updated'] != progress['total_records_updated']:
@@ -892,40 +910,52 @@ def _run_streaming_pipeline_with_checkpoints(
             refresh_materialized_views()
             logging.info("Materialized views refreshed")
 
-        # Determine final status
-        if progress['failed_chunks'] > 0:
+        # --- NEW: Determine final status taking global (bad input) errors into account ---
+        error_message = None
+        if global_errors and failed_rows_count > 0:
+            status = 'PARTIAL_SUCCESS_BAD_INPUT'
+            first_global = global_errors[0]
+            error_message = first_global.get('message') if isinstance(first_global, dict) else str(first_global)
+            logging.warning("Detected global bad-input errors and row-level failures: %s", error_message)
+        elif global_errors:
+            status = 'BAD_INPUT'
+            first_global = global_errors[0]
+            error_message = first_global.get('message') if isinstance(first_global, dict) else str(first_global)
+            logging.error("Detected fatal global bad-input errors: %s", error_message)
+        elif progress['failed_chunks'] > 0:
             status = 'PARTIAL_SUCCESS'
             logging.warning(
                 f"Sync partially successful: {progress['failed_chunks']} chunks failed, "
                 f"will retry on next run"
             )
-        elif summary['failed_rows'] > 0:
+        elif summary.get('failed_rows', 0) > 0:
             status = 'PARTIAL_SUCCESS'
         else:
             status = 'SUCCESS'
 
         # Update sync metadata - use checkpoint manager's tracked values for accuracy
-        # The checkpoint manager tracks what was actually committed to DB per chunk,
-        # while the processor summary may be incomplete if chunks failed mid-processing
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
+            file_path=blob_path,
+            file_size_bytes=blob_size or len(raw_content),
             status=status,
             records_total=summary['total_rows'],
             records_inserted=progress['total_records_inserted'],
             records_updated=progress['total_records_updated'],
-            records_failed=summary['failed_rows'],
-            validation_errors=summary['validation_errors'] if summary['validation_errors'] else None,
+            records_failed=summary.get('failed_rows', 0),
+            error_message=error_message,
+            validation_errors=validation_errors if validation_errors else None,
         )
 
         # Send alerts if needed
-        if summary['validation_errors'] or progress['failed_chunks'] > 0:
+        if validation_errors or progress['failed_chunks'] > 0:
             send_alert_email(
                 sync_id,
                 file_name,
-                f"Sync completed with {summary['failed_rows']} validation errors and "
+                f"Sync completed with {summary.get('failed_rows', 0)} validation errors and "
                 f"{progress['failed_chunks']} failed chunks",
-                summary['validation_errors'],
+                validation_errors,
                 is_warning=True,
             )
 
@@ -961,7 +991,7 @@ def _run_streaming_pipeline_with_checkpoints(
             status,
             records_inserted,
             records_updated,
-            summary['failed_rows'],
+            summary.get('failed_rows', 0),
             total_rows,
             duration_minutes,
             rows_per_minute,
@@ -980,7 +1010,7 @@ def _run_streaming_pipeline_with_checkpoints(
             'records_total': total_rows,
             'records_inserted': records_inserted,
             'records_updated': records_updated,
-            'records_failed': summary['failed_rows'],
+            'records_failed': summary.get('failed_rows', 0),
             'duration_seconds': round(duration_seconds, 2),
             'duration_minutes': round(duration_minutes, 2),
             'rows_per_minute': round(rows_per_minute, 2),
@@ -1005,6 +1035,8 @@ def _run_streaming_pipeline_with_checkpoints(
         update_sync_metadata(
             sync_id=sync_id,
             file_name=file_name,
+            file_path=blob_path,
+            file_size_bytes=blob_size or len(raw_content),
             status='FAILED',
             error_message=str(exc),
         )
