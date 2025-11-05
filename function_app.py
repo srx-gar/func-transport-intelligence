@@ -398,7 +398,11 @@ def _run_sync_pipeline(
         except Exception as driver_error:
             logging.warning(f"⚠️  Driver upsert failed (non-fatal): {driver_error}")
 
-        # Step 6: Refresh dependent materialized views
+        # Step 5.6: Clear cache in parallel (runs in background while MV refresh happens)
+        from helpers.postgres_client import clear_cache_async
+        clear_cache_async()
+
+        # Step 6: Refresh dependent materialized views (runs in parallel with cache clearing)
         if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
             refresh_materialized_views()
             logging.info("Materialized views refreshed")
@@ -905,7 +909,11 @@ def _run_streaming_pipeline_with_checkpoints(
                 progress['total_records_updated']
             )
 
-        # Refresh materialized views
+        # Clear cache in parallel (runs in background while MV refresh happens)
+        from helpers.postgres_client import clear_cache_async
+        clear_cache_async()
+
+        # Refresh materialized views (runs in parallel with cache clearing)
         if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
             refresh_materialized_views()
             logging.info("Materialized views refreshed")

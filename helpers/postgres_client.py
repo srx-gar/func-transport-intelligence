@@ -23,6 +23,15 @@ import re
 import numpy as np
 import difflib
 from typing import Optional
+import threading
+
+# Import requests for cache clearing API calls
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    requests = None
+    REQUESTS_AVAILABLE = False
 
 
 def get_postgres_connection():
@@ -1254,6 +1263,59 @@ def update_sync_metadata(sync_id: str, file_name: str = None, file_path: str = N
         logging.exception('Failed to persist sync metadata to DB: %s', exc)
 
 
+def clear_cache_async():
+    """
+    Clear the API cache asynchronously in a background thread.
+
+    This is called after materialized view refresh to ensure the API serves fresh data.
+    The cache clear runs in parallel to avoid blocking the main pipeline.
+
+    Environment variable:
+    - CACHE_CLEAR_URL: URL to call for cache clearing (default: http://svc-transport-intelligence.azurewebsites.net/api/v1/cache/clear)
+    - ENABLE_CACHE_CLEAR: Enable/disable cache clearing (default: true)
+    """
+    if not REQUESTS_AVAILABLE:
+        logging.warning("requests library not available; skipping cache clear")
+        return
+
+    # Check if cache clearing is enabled
+    if os.getenv('ENABLE_CACHE_CLEAR', 'true').lower() != 'true':
+        logging.info("Cache clearing disabled via ENABLE_CACHE_CLEAR config")
+        return
+
+    cache_url = os.getenv(
+        'CACHE_CLEAR_URL',
+        'http://svc-transport-intelligence.azurewebsites.net/api/v1/cache/clear'
+    )
+
+    def _clear_cache_thread():
+        """Background thread function to clear cache"""
+        try:
+            logging.info(f"🧹 Clearing API cache at {cache_url}")
+            response = requests.delete(
+                cache_url,
+                headers={'Accept': 'application/json'},
+                timeout=30  # 30 second timeout
+            )
+
+            if response.status_code in (200, 204):
+                logging.info(f"✅ Cache cleared successfully (status: {response.status_code})")
+            else:
+                logging.warning(
+                    f"⚠️ Cache clear returned status {response.status_code}: {response.text[:200]}"
+                )
+        except requests.exceptions.Timeout:
+            logging.warning("⚠️ Cache clear request timed out (non-fatal)")
+        except requests.exceptions.RequestException as e:
+            logging.warning(f"⚠️ Cache clear failed (non-fatal): {e}")
+        except Exception as e:
+            logging.warning(f"⚠️ Unexpected error clearing cache (non-fatal): {e}")
+
+    # Start cache clearing in background thread
+    thread = threading.Thread(target=_clear_cache_thread, daemon=True)
+    thread.start()
+    logging.info("🚀 Cache clear request started in background thread")
+
 
 def refresh_materialized_views():
     """Refresh materialized views used by the pipeline.
@@ -1380,6 +1442,7 @@ def refresh_materialized_views():
             logging.warning(f'⚠️ Materialized view refresh completed with errors: {refreshed_count}/{len(view_list)} succeeded. Failed: {", ".join(failed_views)}')
         else:
             logging.info(f'✅ All {refreshed_count} materialized views refreshed successfully')
+
     except Exception as exc:
         logging.exception(f'❌ Failed to refresh materialized views: {exc}')
         if conn:
