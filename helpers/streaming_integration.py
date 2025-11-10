@@ -112,6 +112,21 @@ def _run_streaming_pipeline(
         if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
             refresh_materialized_views()
             logging.info("Materialized views refreshed")
+
+            # Trigger cache prepopulation after MV refresh
+            if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
+                from helpers.cache_prepopulator import trigger_cache_prepopulation_safe
+                logging.info("Triggering cache prepopulation...")
+                success = trigger_cache_prepopulation_safe(
+                    clear_first=True,
+                    concurrency=15
+                )
+                if success:
+                    logging.info("Cache prepopulation job started successfully")
+                else:
+                    logging.warning("Cache prepopulation trigger failed (non-critical, continuing...)")
+            else:
+                logging.info("Cache prepopulation skipped via config")
         else:
             logging.info("Materialized view refresh skipped via config")
 

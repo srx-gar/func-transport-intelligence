@@ -12,6 +12,8 @@
     "USE_POLARS_PARSER": "true",
     "VALIDATION_ERROR_THRESHOLD": "0.10",
     "ENABLE_MV_REFRESH": "true",
+    "ENABLE_CACHE_PREPOPULATION": "true",
+    "TRANSPORT_INTELLIGENCE_SERVICE_URL": "https://svc-transport-intelligence.azurewebsites.net",
     "ALERT_EMAIL": "ops-team@company.com",
     "MANUAL_SYNC_CONTAINER": "data",
     "ENABLE_STREAMING": "true",
