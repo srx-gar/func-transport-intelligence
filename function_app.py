@@ -398,31 +398,31 @@ def _run_sync_pipeline(
         except Exception as driver_error:
             logging.warning(f"⚠️  Driver upsert failed (non-fatal): {driver_error}")
 
-        # Step 5.6: Clear cache in parallel (runs in background while MV refresh happens)
-        from helpers.postgres_client import clear_cache_async
-        clear_cache_async()
-
-        # Step 6: Refresh dependent materialized views (runs in parallel with cache clearing)
-        if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
-            refresh_materialized_views()
-            logging.info("Materialized views refreshed")
-
-            # Step 6.1: Trigger cache prepopulation after MV refresh
-            if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
-                from helpers.cache_prepopulator import trigger_cache_prepopulation_safe
-                logging.info("Triggering cache prepopulation...")
-                success = trigger_cache_prepopulation_safe(
-                    clear_first=True,
-                    concurrency=15
-                )
-                if success:
-                    logging.info("Cache prepopulation job started successfully")
-                else:
-                    logging.warning("Cache prepopulation trigger failed (non-critical, continuing...)")
+        # Step 6: Refresh dependent materialized views
+        try:
+            if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
+                refresh_materialized_views()
+                logging.info("Materialized views refreshed")
             else:
-                logging.info("Cache prepopulation skipped via config")
+                logging.info("Materialized view refresh skipped via config")
+        except Exception as mv_error:
+            logging.error(f"❌ Materialized view refresh failed: {mv_error}", exc_info=True)
+            # Continue to cache prepopulation even if MV refresh fails
+
+        # Step 7: Trigger cache prepopulation (always runs at end of pipeline)
+        if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
+            from helpers.cache_prepopulator import trigger_cache_prepopulation_safe
+            logging.info("Triggering cache prepopulation...")
+            success = trigger_cache_prepopulation_safe(
+                clear_first=True,
+                concurrency=15
+            )
+            if success:
+                logging.info("Cache prepopulation job started successfully")
+            else:
+                logging.warning("Cache prepopulation trigger failed (non-critical, continuing...)")
         else:
-            logging.info("Materialized view refresh skipped via config")
+            logging.info("Cache prepopulation skipped via config")
 
         # Finalize status and record counts
         records_failed = failed_rows_count
@@ -948,29 +948,31 @@ def _run_streaming_pipeline_with_checkpoints(
                 progress['total_records_updated']
             )
 
-        # Clear cache in parallel (runs in background while MV refresh happens)
-        from helpers.postgres_client import clear_cache_async
-        clear_cache_async()
-
-        # Refresh materialized views (runs in parallel with cache clearing)
-        if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
-            refresh_materialized_views()
-            logging.info("Materialized views refreshed")
-
-            # Trigger cache prepopulation after MV refresh
-            if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
-                from helpers.cache_prepopulator import trigger_cache_prepopulation_safe
-                logging.info("Triggering cache prepopulation...")
-                success = trigger_cache_prepopulation_safe(
-                    clear_first=True,
-                    concurrency=15
-                )
-                if success:
-                    logging.info("Cache prepopulation job started successfully")
-                else:
-                    logging.warning("Cache prepopulation trigger failed (non-critical, continuing...)")
+        # Refresh materialized views
+        try:
+            if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
+                refresh_materialized_views()
+                logging.info("Materialized views refreshed")
             else:
-                logging.info("Cache prepopulation skipped via config")
+                logging.info("Materialized view refresh skipped via config")
+        except Exception as mv_error:
+            logging.error(f"❌ Materialized view refresh failed: {mv_error}", exc_info=True)
+            # Continue to cache prepopulation even if MV refresh fails
+
+        # Trigger cache prepopulation (always runs at end of pipeline)
+        if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
+            from helpers.cache_prepopulator import trigger_cache_prepopulation_safe
+            logging.info("Triggering cache prepopulation...")
+            success = trigger_cache_prepopulation_safe(
+                clear_first=True,
+                concurrency=15
+            )
+            if success:
+                logging.info("Cache prepopulation job started successfully")
+            else:
+                logging.warning("Cache prepopulation trigger failed (non-critical, continuing...)")
+        else:
+            logging.info("Cache prepopulation skipped via config")
 
         # --- NEW: Determine final status taking global (bad input) errors into account ---
         error_message = None
