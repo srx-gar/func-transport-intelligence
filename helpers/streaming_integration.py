@@ -109,26 +109,30 @@ def _run_streaming_pipeline(
         validation_errors = summary['validation_errors']
 
         # Refresh materialized views
-        if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
-            refresh_materialized_views()
-            logging.info("Materialized views refreshed")
-
-            # Trigger cache prepopulation after MV refresh
-            if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
-                from helpers.cache_prepopulator import trigger_cache_prepopulation_safe
-                logging.info("Triggering cache prepopulation...")
-                success = trigger_cache_prepopulation_safe(
-                    clear_first=True,
-                    concurrency=15
-                )
-                if success:
-                    logging.info("Cache prepopulation job started successfully")
-                else:
-                    logging.warning("Cache prepopulation trigger failed (non-critical, continuing...)")
+        try:
+            if os.getenv('ENABLE_MV_REFRESH', 'true').lower() == 'true':
+                refresh_materialized_views()
+                logging.info("Materialized views refreshed")
             else:
-                logging.info("Cache prepopulation skipped via config")
+                logging.info("Materialized view refresh skipped via config")
+        except Exception as mv_error:
+            logging.error(f"❌ Materialized view refresh failed: {mv_error}", exc_info=True)
+            # Continue to cache prepopulation even if MV refresh fails
+
+        # Trigger cache prepopulation (always runs at end of pipeline)
+        if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
+            from helpers.cache_prepopulator import trigger_cache_prepopulation_safe
+            logging.info("Triggering cache prepopulation...")
+            success = trigger_cache_prepopulation_safe(
+                clear_first=True,
+                concurrency=15
+            )
+            if success:
+                logging.info("Cache prepopulation job started successfully")
+            else:
+                logging.warning("Cache prepopulation trigger failed (non-critical, continuing...)")
         else:
-            logging.info("Materialized view refresh skipped via config")
+            logging.info("Cache prepopulation skipped via config")
 
         # Determine status
         if global_validation_error and records_failed:
