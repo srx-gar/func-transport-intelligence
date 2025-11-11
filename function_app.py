@@ -9,9 +9,19 @@ from datetime import datetime, timezone
 from typing import Optional
 import sys
 
+# Disable Azure SDK HTTP logging BEFORE importing Azure modules
+os.environ['AZURE_LOG_LEVEL'] = 'CRITICAL'
+os.environ['AZURE_CORE_TRACING'] = 'false'
+os.environ['AZURE_SDK_TRACING_IMPLEMENTATION'] = 'none'
+
 import azure.functions as func
 from azure.core.exceptions import ResourceNotFoundError
 from azure.storage.blob import BlobServiceClient
+
+# Suppress Azure SDK HTTP logging at the earliest possible point
+logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.CRITICAL)
+logging.getLogger('azure.core.pipeline').setLevel(logging.CRITICAL)
+logging.getLogger('azure.core').setLevel(logging.CRITICAL)
 
 from helpers.notifier import send_alert_email
 from helpers.parser import is_gzipped, parse_ztdwr_file
@@ -84,14 +94,17 @@ else:
     logging.getLogger('azure.functions').setLevel(logging.WARNING)
 
     # Suppress Azure Storage SDK HTTP request/response logs (the noisy ones)
-    logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.ERROR)
-    logging.getLogger('azure.core.pipeline.policies').setLevel(logging.ERROR)
-    logging.getLogger('azure.storage').setLevel(logging.WARNING)
-    logging.getLogger('azure.storage.blob').setLevel(logging.WARNING)
-    logging.getLogger('azure.storage.blob._blob_client').setLevel(logging.ERROR)
-    logging.getLogger('azure.storage.blob._download').setLevel(logging.ERROR)
-    logging.getLogger('azure.storage.queue').setLevel(logging.WARNING)
-    logging.getLogger('azure.storage.queue._queue_client').setLevel(logging.ERROR)
+    logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.core.pipeline.policies').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.core.pipeline').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.core').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.storage').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.storage.blob').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.storage.blob._blob_client').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.storage.blob._download').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.storage.queue').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.storage.queue._queue_client').setLevel(logging.CRITICAL)
+    logging.getLogger('azure.identity').setLevel(logging.CRITICAL)
 
     # Also reduce urllib3/requests noise (HTTP client traces)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
@@ -1369,7 +1382,10 @@ def manual_sync(req: func.HttpRequest) -> func.HttpResponse:
         )
 
     try:
-        blob_service = BlobServiceClient.from_connection_string(storage_conn)
+        blob_service = BlobServiceClient.from_connection_string(
+            storage_conn,
+            logging_enable=False  # Disable HTTP request/response logging
+        )
         container_client = blob_service.get_container_client(container)
         blob_client = container_client.get_blob_client(blob_path)
         downloader = blob_client.download_blob()
