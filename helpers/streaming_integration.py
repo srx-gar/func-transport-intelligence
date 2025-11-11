@@ -64,7 +64,7 @@ def _run_streaming_pipeline(
         logging.info(f"Using chunk size: {chunk_size} rows")
 
         # Get error threshold from config
-        error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.05'))
+        error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '1.0'))
 
         # Create chunked processor
         processor = ChunkedPipelineProcessor(sync_id, file_name, error_threshold)

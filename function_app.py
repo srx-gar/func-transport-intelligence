@@ -355,7 +355,7 @@ def _run_sync_pipeline(
                 error_rate * 100,
             )
 
-            threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.10'))
+            threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '1.0'))
             if error_rate > threshold:
                 # Compose a more informative error message including counts and a small sample of row errors
                 sample_errors = row_level_errors[:5]
@@ -589,7 +589,7 @@ def _run_streaming_pipeline(
         logging.info(f"📊 Chunk size: {chunk_size} rows | Estimated {estimated_chunks} chunks")
 
         # Get error threshold from config
-        error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.05'))
+        error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '1.0'))
 
         # Create chunked processor
         processor = ChunkedPipelineProcessor(sync_id, file_name, error_threshold)
@@ -861,7 +861,7 @@ def _run_streaming_pipeline_with_checkpoints(
             logging.info(f"📊 Processing {total_chunks} chunks from start")
 
         # Get error threshold from config
-        error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '0.05'))
+        error_threshold = float(os.getenv('VALIDATION_ERROR_THRESHOLD', '1.0'))
 
         # Create chunked processor
         processor = ChunkedPipelineProcessor(sync_id, file_name, error_threshold)

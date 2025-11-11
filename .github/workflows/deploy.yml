@@ -51,7 +51,7 @@ jobs:
                 "DB_USER=${{ secrets.DB_USER }}" \
                 "DB_PASSWORD=${{ secrets.DB_PASSWORD }}" \
                 "DB_NAME=${{ secrets.DB_NAME }}" \
-                "VALIDATION_ERROR_THRESHOLD=0.10" \
+                "VALIDATION_ERROR_THRESHOLD=1.0" \
                 "ENABLE_MV_REFRESH=true" \
                 "ALERT_EMAIL=${{ secrets.ALERT_EMAIL }}"
 

@@ -37,7 +37,7 @@
     "minimumInterval": "00:00:05",
     "maximumInterval": "00:05:00"
   },
-  "functionTimeout": "03:00:00",
+  "functionTimeout": "01:00:00",
   "extensions": {
     "blobs": {
       "maxDegreeOfParallelism": 4,
