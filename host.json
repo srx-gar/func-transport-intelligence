@@ -33,8 +33,8 @@
   },
   "retry": {
     "strategy": "exponentialBackoff",
-    "maxRetryCount": 3,
-    "minimumInterval": "00:00:05",
+    "maxRetryCount": 5,
+    "minimumInterval": "00:01:00",
     "maximumInterval": "00:05:00"
   },
   "functionTimeout": "01:00:00",
