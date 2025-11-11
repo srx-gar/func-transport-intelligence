@@ -121,9 +121,9 @@ def _run_streaming_pipeline(
 
         # Trigger cache prepopulation (always runs at end of pipeline)
         if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
-            from helpers.cache_prepopulator import trigger_cache_prepopulation_safe
+            from helpers.cache_prepopulator import trigger_cache_repopulation_safe
             logging.info("Triggering cache prepopulation...")
-            success = trigger_cache_prepopulation_safe(
+            success = trigger_cache_repopulation_safe(
                 clear_first=True,
                 concurrency=15
             )
