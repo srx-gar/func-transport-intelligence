@@ -426,10 +426,9 @@ def _run_sync_pipeline(
         if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
             from helpers.cache_prepopulator import trigger_cache_repopulation_safe
             logging.info("Triggering cache prepopulation...")
-            success = trigger_cache_repopulation_safe(
-                clear_first=True,
-                concurrency=15
-            )
+            # Call using positional args to satisfy static analyzer and maintain compatibility
+            # (service_url=None -> use env var, concurrency=15, clear_first=True)
+            success = trigger_cache_repopulation_safe(None, 15, True)
             if success:
                 logging.info("Cache prepopulation job started successfully")
             else:
@@ -976,10 +975,9 @@ def _run_streaming_pipeline_with_checkpoints(
         if os.getenv('ENABLE_CACHE_PREPOPULATION', 'true').lower() == 'true':
             from helpers.cache_prepopulator import trigger_cache_repopulation_safe
             logging.info("Triggering cache prepopulation...")
-            success = trigger_cache_repopulation_safe(
-                clear_first=True,
-                concurrency=15
-            )
+            # Call using positional args to satisfy static analyzer and maintain compatibility
+            # (service_url=None -> use env var, concurrency=15, clear_first=True)
+            success = trigger_cache_repopulation_safe(None, 15, True)
             if success:
                 logging.info("Cache prepopulation job started successfully")
             else:

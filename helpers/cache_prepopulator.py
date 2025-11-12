@@ -12,7 +12,8 @@ from urllib.parse import urlencode
 def trigger_cache_repopulation(
     service_url: Optional[str] = None,
     concurrency: int = 10,
-    timeout_seconds: int = 30
+    timeout_seconds: int = 30,
+    clear_first: bool = False,
 ) -> Dict[str, Any]:
     """
     Trigger async cache repopulation in the transport intelligence service.
@@ -26,6 +27,7 @@ def trigger_cache_repopulation(
                     (defaults to TRANSPORT_INTELLIGENCE_SERVICE_URL env var)
         concurrency: Number of concurrent requests for repopulation (1-20)
         timeout_seconds: HTTP request timeout in seconds
+        clear_first: Whether to clear existing cache before repopulating
 
     Returns:
         Dict containing job information:
@@ -57,7 +59,10 @@ def trigger_cache_repopulation(
 
     # Build endpoint URL with query parameters
     endpoint = f"{service_url}/api/v1/cache/repopulate"
-    params = urlencode({'concurrency': concurrency})
+    # Include clearFirst flag as a query parameter if requested by caller.
+    # Use camelCase 'clearFirst' to match common API conventions; server may ignore unknown params.
+    params_dict = {'concurrency': concurrency, 'clearFirst': 'true' if clear_first else 'false'}
+    params = urlencode(params_dict)
     full_url = f"{endpoint}?{params}"
 
     logger.info(f"Triggering cache repopulation: {full_url}")
@@ -123,7 +128,8 @@ def trigger_cache_repopulation(
 
 def trigger_cache_repopulation_safe(
     service_url: Optional[str] = None,
-    concurrency: int = 10
+    concurrency: int = 10,
+    clear_first: bool = False,
 ) -> bool:
     """
     Safe wrapper for trigger_cache_repopulation that catches and logs exceptions.
@@ -134,6 +140,7 @@ def trigger_cache_repopulation_safe(
     Args:
         service_url: Base URL of the transport intelligence service
         concurrency: Number of concurrent requests for repopulation (1-20)
+        clear_first: Whether to clear existing cache before repopulating
 
     Returns:
         True if trigger was successful, False if it failed
@@ -141,9 +148,11 @@ def trigger_cache_repopulation_safe(
     logger = logging.getLogger(__name__)
 
     try:
+        # Pass-through clear_first support for backward-compatible callers
         result = trigger_cache_repopulation(
             service_url=service_url,
-            concurrency=concurrency
+            concurrency=concurrency,
+            clear_first=clear_first
         )
         return result.get('success', False)
     except Exception as e:
