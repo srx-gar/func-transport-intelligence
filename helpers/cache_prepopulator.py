@@ -14,6 +14,7 @@ def trigger_cache_repopulation(
     concurrency: int = 10,
     timeout_seconds: int = 30,
     clear_first: bool = False,
+    cleanup_first: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Trigger async cache repopulation in the transport intelligence service.
@@ -28,6 +29,8 @@ def trigger_cache_repopulation(
         concurrency: Number of concurrent requests for repopulation (1-20)
         timeout_seconds: HTTP request timeout in seconds
         clear_first: Whether to clear existing cache before repopulating
+        cleanup_first: Preferred param name for clearing existing cache. If
+                       provided it takes precedence over `clear_first`.
 
     Returns:
         Dict containing job information:
@@ -59,9 +62,18 @@ def trigger_cache_repopulation(
 
     # Build endpoint URL with query parameters
     endpoint = f"{service_url}/api/v1/cache/repopulate"
-    # Include clearFirst flag as a query parameter if requested by caller.
-    # Use camelCase 'clearFirst' to match common API conventions; server may ignore unknown params.
-    params_dict = {'concurrency': concurrency, 'clearFirst': 'true' if clear_first else 'false'}
+
+    # Determine cleanup/clear flag precedence: explicit cleanup_first overrides clear_first
+    cleanup_flag = cleanup_first if cleanup_first is not None else clear_first
+
+    # Include cleanupFirst query parameter (new preferred name). For backward compatibility,
+    # include clearFirst only when the caller used the old `clear_first` parameter (i.e. when
+    # cleanup_first was not explicitly provided).
+    params_dict = {'concurrency': concurrency, 'cleanupFirst': 'true' if cleanup_flag else 'false'}
+    if cleanup_first is None and clear_first:
+        # Caller used the old parameter; include legacy name too
+        params_dict['clearFirst'] = 'true'
+
     params = urlencode(params_dict)
     full_url = f"{endpoint}?{params}"
 
@@ -130,6 +142,7 @@ def trigger_cache_repopulation_safe(
     service_url: Optional[str] = None,
     concurrency: int = 10,
     clear_first: bool = False,
+    cleanup_first: Optional[bool] = None,
 ) -> bool:
     """
     Safe wrapper for trigger_cache_repopulation that catches and logs exceptions.
@@ -141,6 +154,7 @@ def trigger_cache_repopulation_safe(
         service_url: Base URL of the transport intelligence service
         concurrency: Number of concurrent requests for repopulation (1-20)
         clear_first: Whether to clear existing cache before repopulating
+        cleanup_first: Prefered name for clear flag; if provided it takes precedence
 
     Returns:
         True if trigger was successful, False if it failed
@@ -148,11 +162,12 @@ def trigger_cache_repopulation_safe(
     logger = logging.getLogger(__name__)
 
     try:
-        # Pass-through clear_first support for backward-compatible callers
+        # Pass-through clear_first/cleanup_first support for backward-compatible callers
         result = trigger_cache_repopulation(
             service_url=service_url,
             concurrency=concurrency,
-            clear_first=clear_first
+            clear_first=clear_first,
+            cleanup_first=cleanup_first,
         )
         return result.get('success', False)
     except Exception as e:
